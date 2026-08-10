@@ -3,7 +3,11 @@ from __future__ import annotations
 
 import ctypes
 from ctypes import wintypes
+from collections import deque
+import math
 import os
+import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -11,6 +15,13 @@ import threading
 import time
 import tkinter as tk
 from tkinter import ttk
+
+try:
+    import pythoncom
+    import win32com.client
+except ImportError:
+    pythoncom = None
+    win32com = None
 
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 psapi = ctypes.WinDLL("psapi", use_last_error=True)
@@ -101,6 +112,24 @@ def pretty_size(value):
     return f"{value / 1024**3:.2f} GB" if value >= 1024**3 else f"{value / 1024**2:.0f} MB"
 
 
+def pretty_speed(value):
+    if value >= 1024**3: return f"{value / 1024**3:.2f} GB/s"
+    if value >= 1024**2: return f"{value / 1024**2:.1f} MB/s"
+    return f"{max(0, value) / 1024:.0f} KB/s"
+
+
+def norm_name(name):
+    key = name.lower()
+    return key[:-4] if key.endswith(".exe") else key
+
+
+def temp_celsius(raw):
+    try: value = float(raw)
+    except (TypeError, ValueError): return None
+    celsius = value / 10 - 273.15 if 1500 <= value <= 4500 else value - 273.15 if 250 <= value <= 500 else None
+    return max(0.0, min(120.0, celsius)) if celsius is not None else None
+
+
 def system_times():
     idle = wintypes.FILETIME(); kernel = wintypes.FILETIME(); user = wintypes.FILETIME()
     if not kernel32.GetSystemTimes(ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)): return None
@@ -168,11 +197,24 @@ class App(tk.Tk):
         self.sys_sample = None
         self.net_sample = None
         self.gpu, self.npu = None, None
+        self.temp_cpu, self.temp_gpu = None, None
+        self.gpu_pids, self.disk_names, self.net_pids = {}, {}, {}
+        self.queue = queue.Queue()
+        self.collecting = False
+        self.last_rows = []
+        self.cpu_percent = 0.0
+        self.power_sample = None
+        self.power_history = deque(maxlen=180)
+        self.power_stop = threading.Event()
         self.no_restart = {"svchost.exe", "sihost.exe", "explorer.exe", "shellhost.exe", "searchhost.exe", "startmenuexperiencehost.exe", "runtimebroker.exe", "textinputhost.exe", "lockapp.exe", "unsecapp.exe", "dllhost.exe", "conhost.exe", "splwow64.exe"}
         self.build()
+        self.protocol("WM_DELETE_WINDOW", self.close)
         self.after(120, self.refresh)  # 启动时刷新一次
+        self.after(120, self._drain)
         self.after(200, self.update_metrics)
+        self.after(300, self.tree.focus_set)
         threading.Thread(target=self.poll_accelerators, daemon=True).start()
+        threading.Thread(target=self.poll_power, daemon=True).start()
 
     def build(self):
         px = lambda value: int(value * self.dpi_scale)
@@ -187,22 +229,184 @@ class App(tk.Tk):
         self.summary = tk.Label(top, text="正在读取…", font=("Microsoft YaHei UI", 10), bg="#f4f6f8", fg="#536171"); self.summary.pack(side="left", padx=18)
         self.metrics = tk.Label(top, text="CPU --  内存 --  GPU --  NPU --  磁盘 --", font=("Microsoft YaHei UI", 10, "bold"), bg="#f4f6f8", fg="#27364a")
         self.metrics.pack(side="right", padx=(0, 15))
-        ttk.Button(top, text="↻ 立即刷新", command=self.refresh).pack(side="right")
+        ttk.Button(top, text="↻ 立即刷新", command=lambda: self.refresh(manual=True)).pack(side="right")
         ttk.Button(top, text="结束选中进程", command=self.kill_selected).pack(side="right", padx=(0, 10))
-        body = tk.Frame(self, bg="#f4f6f8", padx=16); body.pack(fill="both", expand=True)
-        cols = ("status", "name", "count", "cpu", "memory")
+        self.tabs = ttk.Notebook(self)
+        self.tabs.pack(fill="both", expand=True)
+        process_tab = tk.Frame(self.tabs, bg="#f4f6f8")
+        power_tab = tk.Frame(self.tabs, bg="#f4f6f8")
+        self.tabs.add(process_tab, text=" 进程管理 ")
+        self.tabs.add(power_tab, text=" CPU 实时功耗 ")
+
+        body = tk.Frame(process_tab, bg="#f4f6f8", padx=16); body.pack(fill="both", expand=True)
+        cols = ("status", "name", "count", "cpu", "memory", "gpu", "disk", "net")
         self.tree = ttk.Treeview(body, columns=cols, show="tree headings", selectmode="extended")
         self.tree.heading("#0", text=""); self.tree.column("#0", width=px(42), minwidth=px(42), stretch=False)
-        for key, label, width in [("status", "状态", 110), ("name", "软件", 520), ("count", "进程数", 115), ("cpu", "CPU", 140), ("memory", "内存", 160)]:
-            self.tree.heading(key, text=label, command=lambda c=key: self.change_sort(c)); self.tree.column(key, width=px(width), anchor="e" if key in ("count", "cpu", "memory") else "w", stretch=key == "name")
+        for key, label, width in [("status", "状态", 100), ("name", "软件", 420), ("count", "进程数", 88), ("cpu", "CPU", 115), ("memory", "内存", 125), ("gpu", "GPU", 85), ("disk", "磁盘", 110), ("net", "网络", 100)]:
+            self.tree.heading(key, text=label, command=lambda c=key: self.change_sort(c)); self.tree.column(key, width=px(width), anchor="e" if key in ("count", "cpu", "memory", "gpu", "disk", "net") else "w", stretch=key == "name")
         self.tree.tag_configure("hung", foreground="#c62828"); self.tree.tag_configure("hot", foreground="#d35400")
         bar = ttk.Scrollbar(body, orient="vertical", command=self.tree.yview); self.tree.configure(yscrollcommand=bar.set)
         self.tree.pack(side="left", fill="both", expand=True); bar.pack(side="right", fill="y")
-        self.tree.bind("<Double-1>", lambda _: self.kill_selected()); self.tree.bind("<Delete>", lambda _: self.kill_selected()); self.tree.bind("<Button-3>", self.menu_open)
+        self.tree.bind("<Double-1>", lambda _: self.kill_selected()); self.tree.bind("<Button-3>", self.menu_open)
+        self.tree.bind("<Up>", self.on_up); self.tree.bind("<Down>", self.on_down); self.tree.bind("<Home>", self.on_home); self.tree.bind("<End>", self.on_end)
+        self.bind("<Up>", self.on_up); self.bind("<Down>", self.on_down); self.bind("<Home>", self.on_home); self.bind("<End>", self.on_end); self.bind("<Delete>", self.on_delete)
         self.menu = tk.Menu(self, tearoff=False, font=("Microsoft YaHei UI", 10)); self.menu.add_command(label="结束进程", command=self.kill_selected); self.menu.add_command(label="重启", command=self.restart_selected)
-        bottom = tk.Frame(self, bg="#f4f6f8", padx=16, pady=11); bottom.pack(fill="x")
-        tk.Label(bottom, text="右键可结束或重启；Delete 直接结束。", bg="#f4f6f8", fg="#687687", font=("Microsoft YaHei UI", 9)).pack(side="left")
+        bottom = tk.Frame(process_tab, bg="#f4f6f8", padx=16, pady=11); bottom.pack(fill="x")
+        tk.Label(bottom, text="↑/↓ 切换选中，Delete 直接结束；右键可结束或重启；点表头可按 CPU/内存/GPU/磁盘/网络排序。", bg="#f4f6f8", fg="#687687", font=("Microsoft YaHei UI", 9)).pack(side="left")
         self.auto_text = tk.StringVar(value="自动刷新：已关闭"); ttk.Button(bottom, textvariable=self.auto_text, command=self.toggle_auto).pack(side="right")
+        self.build_power_tab(power_tab)
+
+    def build_power_tab(self, parent):
+        px = lambda value: int(value * self.dpi_scale)
+        self.power_package_var = tk.StringVar(value="--.- W")
+        self.power_core_var = tk.StringVar(value="--.- W")
+        self.power_dram_var = tk.StringVar(value="--.-- W")
+        self.power_cpu_var = tk.StringVar(value="-- %")
+        self.power_avg_var = tk.StringVar(value="平均 --.- W")
+        self.power_peak_var = tk.StringVar(value="峰值 --.- W")
+        self.power_status_var = tk.StringVar(value="正在连接 Intel RAPL 传感器…")
+
+        header = tk.Frame(parent, bg="#f4f6f8", padx=18, pady=14)
+        header.pack(fill="x")
+        tk.Label(header, text="CPU 实时功耗", font=("Microsoft YaHei UI", 17, "bold"), bg="#f4f6f8", fg="#172b4d").pack(side="left")
+        tk.Label(header, text="Intel Core Ultra 7 258V · 1 秒刷新 · 约 3 分钟历史", font=("Microsoft YaHei UI", 10), bg="#f4f6f8", fg="#687687").pack(side="left", padx=16)
+        ttk.Button(header, text="重置统计", command=self.reset_power_stats).pack(side="right")
+
+        cards = tk.Frame(parent, bg="#f4f6f8", padx=14)
+        cards.pack(fill="x", pady=(0, 12))
+        for column in range(4):
+            cards.grid_columnconfigure(column, weight=1, uniform="power")
+        self._power_card(cards, 0, "CPU PACKAGE", self.power_package_var, "#0078d4")
+        self._power_card(cards, 1, "CPU 核心", self.power_core_var, "#008b72")
+        self._power_card(cards, 2, "DRAM", self.power_dram_var, "#7048a8")
+        self._power_card(cards, 3, "CPU 占用", self.power_cpu_var, "#d35400")
+
+        panel = tk.Frame(parent, bg="white", highlightbackground="#d7dee8", highlightthickness=1)
+        panel.pack(fill="both", expand=True, padx=18, pady=(0, 12))
+        panel_head = tk.Frame(panel, bg="white")
+        panel_head.pack(fill="x", padx=14, pady=(10, 0))
+        tk.Label(panel_head, text="CPU Package 功耗曲线", font=("Microsoft YaHei UI", 11, "bold"), bg="white", fg="#27364a").pack(side="left")
+        tk.Label(panel_head, textvariable=self.power_avg_var, font=("Microsoft YaHei UI", 10), bg="white", fg="#687687").pack(side="right", padx=(12, 0))
+        tk.Label(panel_head, textvariable=self.power_peak_var, font=("Microsoft YaHei UI", 10, "bold"), bg="white", fg="#d35400").pack(side="right")
+        self.power_canvas = tk.Canvas(panel, bg="white", highlightthickness=0, height=px(300))
+        self.power_canvas.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self.power_canvas.bind("<Configure>", lambda _event: self.draw_power_graph())
+
+        status = tk.Frame(parent, bg="#f4f6f8", padx=18)
+        status.pack(fill="x", pady=(0, 12))
+        self.power_status_label = tk.Label(status, textvariable=self.power_status_var, font=("Microsoft YaHei UI", 10, "bold"), bg="#f4f6f8", fg="#008b72")
+        self.power_status_label.pack(side="left")
+        tk.Label(status, text="数据源：Windows Intel RAPL　｜　258V 官方最大睿频功耗：37W", font=("Microsoft YaHei UI", 9), bg="#f4f6f8", fg="#687687").pack(side="right")
+
+    def _power_card(self, parent, column, title, variable, color):
+        frame = tk.Frame(parent, bg="white", highlightbackground="#d7dee8", highlightthickness=1)
+        frame.grid(row=0, column=column, sticky="nsew", padx=(4, 4), pady=0)
+        tk.Label(frame, text=title, font=("Microsoft YaHei UI", 9, "bold"), bg="white", fg="#687687").pack(anchor="w", padx=14, pady=(10, 2))
+        tk.Label(frame, textvariable=variable, font=("Microsoft YaHei UI", 20, "bold"), bg="white", fg=color).pack(anchor="w", padx=14, pady=(0, 12))
+
+    def poll_power(self):
+        if pythoncom is None or win32com is None:
+            self.queue.put(("power_error", "缺少 pywin32，无法读取 Intel RAPL 功耗传感器"))
+            return
+        pythoncom.CoInitialize()
+        try:
+            locator = win32com.client.Dispatch("WbemScripting.SWbemLocator")
+            service = locator.ConnectServer(".", "root\\cimv2")
+            service.Security_.ImpersonationLevel = 3
+            while not self.power_stop.is_set():
+                try:
+                    readings = {}
+                    results = service.ExecQuery(
+                        "SELECT Name, Power FROM Win32_PerfFormattedData_PowerMeterCounter_EnergyMeter"
+                    )
+                    for item in results:
+                        readings[str(item.Name)] = float(item.Power) / 1000.0
+                    package = readings.get("RAPL_Package0_PKG")
+                    if package is None:
+                        raise RuntimeError("未找到 RAPL_Package0_PKG 传感器")
+                    sample = (
+                        time.time(),
+                        package,
+                        readings.get("RAPL_Package0_PP0", 0.0),
+                        readings.get("RAPL_Package0_DRAM", 0.0),
+                    )
+                    self.queue.put(("power", sample))
+                    self.power_stop.wait(1.0)
+                except Exception as exc:
+                    self.queue.put(("power_error", str(exc)))
+                    self.power_stop.wait(3.0)
+        finally:
+            pythoncom.CoUninitialize()
+
+    def apply_power(self, sample):
+        self.power_sample = sample
+        self.power_history.append(sample)
+        _, package, core, dram = sample
+        self.power_package_var.set(f"{package:.1f} W")
+        self.power_core_var.set(f"{core:.1f} W")
+        self.power_dram_var.set(f"{dram:.2f} W")
+        self.power_cpu_var.set(f"{self.cpu_percent:.0f} %")
+        values = [item[1] for item in self.power_history]
+        self.power_avg_var.set(f"平均 {sum(values) / len(values):.1f} W")
+        self.power_peak_var.set(f"峰值 {max(values):.1f} W")
+        if package >= 35.15:
+            text, color = "接近 37W 官方睿频功耗上限", "#c62828"
+        elif self.cpu_percent >= 80:
+            text, color = "高负载运行中", "#d35400"
+        elif self.cpu_percent >= 30:
+            text, color = "正常工作负载", "#008b72"
+        else:
+            text, color = "轻载运行", "#0078d4"
+        self.power_status_var.set(text)
+        self.power_status_label.configure(fg=color)
+        self.draw_power_graph()
+
+    def reset_power_stats(self):
+        if self.power_sample:
+            self.power_history.clear()
+            self.apply_power(self.power_sample)
+
+    def draw_power_graph(self):
+        if not hasattr(self, "power_canvas"):
+            return
+        canvas = self.power_canvas
+        canvas.delete("all")
+        width, height = max(canvas.winfo_width(), 100), max(canvas.winfo_height(), 100)
+        left, right, top, bottom = 48, 14, 12, 28
+        plot_w, plot_h = max(width - left - right, 10), max(height - top - bottom, 10)
+        values = [item[1] for item in self.power_history]
+        observed = max(values, default=0.0)
+        y_max = max(40.0, math.ceil(observed / 10.0) * 10.0)
+
+        for watts in range(0, int(y_max) + 1, 10):
+            y = top + plot_h * (1.0 - watts / y_max)
+            canvas.create_line(left, y, left + plot_w, y, fill="#e3e8ef")
+            canvas.create_text(left - 8, y, text=str(watts), fill="#687687", anchor="e", font=("Microsoft YaHei UI", 8))
+
+        limit_y = top + plot_h * (1.0 - 37.0 / y_max)
+        canvas.create_line(left, limit_y, left + plot_w, limit_y, fill="#d35400", dash=(5, 4))
+        canvas.create_text(left + plot_w - 4, limit_y - 5, text="37W MTP", fill="#d35400", anchor="se", font=("Microsoft YaHei UI", 8, "bold"))
+
+        if not values:
+            canvas.create_text(width / 2, height / 2, text="等待功耗数据…", fill="#687687", font=("Microsoft YaHei UI", 11))
+            return
+
+        points = []
+        for index, value in enumerate(values):
+            x = left + plot_w * index / max(len(values) - 1, 1)
+            y = top + plot_h * (1.0 - min(value, y_max) / y_max)
+            points.extend((x, y))
+        if len(values) > 1:
+            canvas.create_polygon([left, top + plot_h, *points, left + plot_w, top + plot_h], fill="#e2f2fb", outline="")
+            canvas.create_line(points, fill="#0078d4", width=2, smooth=True)
+        else:
+            canvas.create_oval(points[0] - 2, points[1] - 2, points[0] + 2, points[1] + 2, fill="#0078d4", outline="")
+        canvas.create_text(left, height - 6, text="约 3 分钟历史", fill="#687687", anchor="sw", font=("Microsoft YaHei UI", 8))
+        canvas.create_text(left + plot_w, height - 6, text=time.strftime("%H:%M:%S", time.localtime(self.power_history[-1][0])), fill="#687687", anchor="se", font=("Microsoft YaHei UI", 8))
+
+    def close(self):
+        self.power_stop.set()
+        self.destroy()
 
     def menu_open(self, event):
         row = self.tree.identify_row(event.y)
@@ -210,8 +414,34 @@ class App(tk.Tk):
             self.tree.selection_set(row); self.menu.tk_popup(event.x_root, event.y_root)
         return "break"
 
+    def select_relative(self, offset):
+        items = self.tree.get_children()
+        if not items: return "break"
+        current = self.tree.selection()
+        index = self.tree.index(current[0]) + offset if current else (0 if offset > 0 else len(items) - 1)
+        index = max(0, min(len(items) - 1, index))
+        self.tree.selection_set(items[index]); self.tree.focus(items[index]); self.tree.see(items[index])
+        return "break"
+
+    def on_up(self, event): return self.select_relative(-1)
+
+    def on_down(self, event): return self.select_relative(1)
+
+    def on_home(self, event):
+        items = self.tree.get_children()
+        if items: self.tree.selection_set(items[0]); self.tree.focus(items[0]); self.tree.see(items[0])
+        return "break"
+
+    def on_end(self, event):
+        items = self.tree.get_children()
+        if items: self.tree.selection_set(items[-1]); self.tree.focus(items[-1]); self.tree.see(items[-1])
+        return "break"
+
+    def on_delete(self, event):
+        self.kill_selected(); return "break"
+
     def change_sort(self, key):
-        self.desc = not self.desc if self.sort == key else key in ("cpu", "memory"); self.sort = key; self.refresh()
+        self.desc = not self.desc if self.sort == key else key in ("cpu", "memory", "gpu", "disk", "net"); self.sort = key; self.refresh()
 
     def toggle_auto(self):
         self.auto = not self.auto; self.auto_text.set("自动刷新：开启" if self.auto else "自动刷新：已关闭")
@@ -221,25 +451,74 @@ class App(tk.Tk):
     def auto_refresh(self): self.job = None; self.refresh()
 
     def poll_accelerators(self):
-        """GPU/NPU counters are optional Windows performance counters; keep their polling off the UI thread."""
-        command = """$g=(Get-Counter '\\GPU Engine(*)\\Utilization Percentage' -ErrorAction SilentlyContinue).CounterSamples; $n=(Get-Counter '\\NPU Engine(*)\\Utilization Percentage' -ErrorAction SilentlyContinue).CounterSamples; $gs=if($g){($g|Measure-Object CookedValue -Sum).Sum}else{-1}; $ns=if($n){($n|Measure-Object CookedValue -Sum).Sum}else{-1}; Write-Output ([string]::Format('{0:F1}|{1:F1}',$gs,$ns))"""
+        """GPU/NPU/温度/磁盘/网络等计数器在后台线程轮询，避免阻塞界面。"""
+        command = """$o = New-Object System.Collections.Generic.List[string]
+$paths = '\\GPU Engine(*)\\Utilization Percentage','\\NPU Engine(*)\\Utilization Percentage','\\Thermal Zone Information(*)\\Temperature','\\GPU Adapter Temperature(*)','\\Process(*)\\IO Data Bytes/sec'
+foreach ($x in $paths) {
+  $rr = $null
+  try { $rr = Get-Counter $x -ErrorAction Stop } catch { }
+  if ($rr) {
+    foreach ($s in $rr.CounterSamples) {
+      if ($x -like '*GPU Engine*') {
+        if ($s.InstanceName -match 'pid_(\\d+)') { $o.Add(('G|{0}|{1:F2}' -f $Matches[1], $s.CookedValue)) }
+      } elseif ($x -like '*NPU Engine*') {
+        $o.Add(('U|{0:F2}' -f $s.CookedValue))
+      } elseif ($x -like '*Thermal Zone*') {
+        $o.Add(('T|{0}' -f $s.CookedValue))
+      } elseif ($x -like '*GPU Adapter*') {
+        $o.Add(('V|{0}' -f $s.CookedValue))
+      } elseif ($x -like '*IO Data*') {
+        $n = ($s.InstanceName -split '#')[0]
+        if ($n -ne '_Total' -and $n -ne 'idle' -and $n -ne 'Idle') { $o.Add(('D|{0}|{1:F0}' -f $n, $s.CookedValue)) }
+      }
+    }
+  }
+}
+$c = @{}
+Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue | ForEach-Object { if ($_.OwningProcess) { $c[$_.OwningProcess] = 1 + $c[$_.OwningProcess] } }
+Get-NetUDPEndpoint -ErrorAction SilentlyContinue | ForEach-Object { if ($_.OwningProcess) { $c[$_.OwningProcess] = 1 + $c[$_.OwningProcess] } }
+foreach ($k in $c.Keys) { $o.Add(('N|{0}|{1}' -f $k, $c[$k])) }
+$o"""
         while True:
             try:
-                result = subprocess.run(["powershell.exe", "-NoProfile", "-Command", command], capture_output=True, text=True, timeout=8, creationflags=0x08000000)
-                parts = result.stdout.strip().split("|")
-                if len(parts) == 2:
-                    self.gpu = max(0.0, min(100.0, float(parts[0]))) if float(parts[0]) >= 0 else None
-                    self.npu = max(0.0, min(100.0, float(parts[1]))) if float(parts[1]) >= 0 else None
+                result = subprocess.run(["powershell.exe", "-NoProfile", "-Command", command], capture_output=True, text=True, timeout=12, creationflags=0x08000000)
+                self._parse_counters(result.stdout)
             except (OSError, ValueError, subprocess.SubprocessError):
                 pass
-            time.sleep(4)
+            time.sleep(3)
+
+    def _parse_counters(self, stdout):
+        gpu, npu, disk, net = {}, [], {}, {}
+        thermals, gtemps = [], []
+        for line in stdout.splitlines():
+            parts = line.split("|")
+            if not parts: continue
+            try:
+                if parts[0] == "G": gpu[int(parts[1])] = gpu.get(int(parts[1]), 0.0) + float(parts[2])
+                elif parts[0] == "U": npu.append(float(parts[1]))
+                elif parts[0] == "T": thermals.append(float(parts[1]))
+                elif parts[0] == "V": gtemps.append(float(parts[1]))
+                elif parts[0] == "D": disk[parts[1]] = disk.get(parts[1], 0.0) + float(parts[2])
+                elif parts[0] == "N": net[int(parts[1])] = net.get(int(parts[1]), 0) + int(parts[2])
+            except (ValueError, IndexError):
+                continue
+        self.gpu_pids, self.disk_names, self.net_pids = gpu, disk, net
+        self.gpu = min(100.0, sum(gpu.values())) if gpu else None
+        self.npu = min(100.0, sum(npu)) if npu else None
+        temps = [temp_celsius(x) for x in thermals]; temps = [x for x in temps if x is not None]
+        self.temp_cpu = max(temps) if temps else None
+        valid = [max(0.0, min(120.0, x)) for x in gtemps]
+        self.temp_gpu = max(valid) if valid else None
 
     def update_metrics(self):
         now = time.perf_counter(); current = system_times(); cpu_text = "--"
         if current and self.sys_sample:
             idle = current[0] - self.sys_sample[0]; total = (current[1] + current[2]) - (self.sys_sample[1] + self.sys_sample[2])
-            if total > 0: cpu_text = f"{max(0, min(100, (total - idle) / total * 100)):.0f}%"
+            if total > 0:
+                self.cpu_percent = max(0, min(100, (total - idle) / total * 100))
+                cpu_text = f"{self.cpu_percent:.0f}%"
         if current: self.sys_sample = current
+        self.power_cpu_var.set(f"{self.cpu_percent:.0f} %")
         memory = MEMSTAT(); memory.length = ctypes.sizeof(memory)
         if kernel32.GlobalMemoryStatusEx(ctypes.byref(memory)):
             memory_text = f"{memory.load}%"
@@ -257,7 +536,10 @@ class App(tk.Tk):
         except OSError: disk_text = "--"
         gpu_text = f"{self.gpu:.0f}%" if self.gpu is not None else "--"
         npu_text = f"{self.npu:.0f}%" if self.npu is not None else "--"
-        self.metrics.config(text=f"CPU {cpu_text}  内存 {memory_text}  GPU {gpu_text}  NPU {npu_text}  磁盘 {disk_text}")
+        cpu_temp = f"{self.temp_cpu:.0f}°C" if self.temp_cpu is not None else "--"
+        gpu_temp = f"{self.temp_gpu:.0f}°C" if self.temp_gpu is not None else "--"
+        power_text = f"{self.power_sample[1]:.1f}W" if self.power_sample else "--"
+        self.metrics.config(text=f"CPU {cpu_text}  功耗 {power_text}  内存 {memory_text}  GPU {gpu_text}  NPU {npu_text}  磁盘 {disk_text}  CPU温 {cpu_temp}  GPU温 {gpu_temp}")
         self.after(1000, self.update_metrics)
 
     def collect(self):
@@ -277,27 +559,64 @@ class App(tk.Tk):
                 total, cpu = cpu_time(handle), 0.0; old = self.samples.get(pid)
                 if total is not None and old and now > old[1]: cpu = max(0.0, min(100.0, (total - old[0]) / 10_000_000 / (now - old[1]) / (os.cpu_count() or 1) * 100))
                 if total is not None: self.samples[pid] = (total, now)
-                rows.append({"pid": pid, "name": name, "path": path, "memory": memory, "cpu": cpu, "hung": pid in hung})
+                rows.append({"pid": pid, "name": name, "path": path, "memory": memory, "cpu": cpu, "hung": pid in hung, "gpu": self.gpu_pids.get(pid, 0.0), "net": self.net_pids.get(pid, 0)})
             finally: kernel32.CloseHandle(handle)
         self.samples = {p: x for p, x in self.samples.items() if p in alive}
         return rows
 
-    def refresh(self):
+    def refresh(self, manual=False):
         if self.job: self.after_cancel(self.job); self.job = None
-        selected = {self.keys.get(x) for x in self.tree.selection()}; groups = {}
-        for row in self.collect():
-            key = row["name"].lower(); group = groups.setdefault(key, {"name": row["name"], "path": row["path"], "pids": [], "cpu": 0.0, "memory": 0, "hung": False})
-            group["pids"].append(row["pid"]); group["cpu"] += row["cpu"]; group["memory"] += row["memory"]; group["hung"] |= row["hung"]
+        if self.auto: self.job = self.after(1200, self.auto_refresh)
+        if self.collecting: return
+        self.collecting = True
+        threading.Thread(target=self._collect_worker, args=(manual, self.sort, self.desc), daemon=True).start()
+
+    def _collect_worker(self, manual, sort, desc):
+        try: rows = self.collect()
+        except Exception: rows = None
+        self.queue.put(("rows", rows, manual, sort, desc))
+
+    def _drain(self):
+        try:
+            while True:
+                msg = self.queue.get_nowait()
+                if msg[0] == "rows":
+                    self.collecting = False
+                    if msg[1] is not None: self.apply_rows(msg[1], msg[2], msg[3], msg[4])
+                elif msg[0] == "refresh":
+                    self.collecting = False
+                    self.refresh(manual=False)
+                elif msg[0] == "power":
+                    self.apply_power(msg[1])
+                elif msg[0] == "power_error":
+                    self.power_status_var.set(f"功耗传感器读取失败：{msg[1]}")
+                    self.power_status_label.configure(fg="#c62828")
+        except queue.Empty:
+            pass
+        self.after(120, self._drain)
+
+    def apply_rows(self, rows, manual, sort, desc):
+        self.last_rows = rows
+        current_selection = self.tree.selection()
+        selected = {self.keys.get(x) for x in current_selection}
+        groups = {}
+        fallback = self.tree.index(current_selection[0]) if current_selection else 0
+        for row in rows:
+            key = row["name"].lower()
+            group = groups.setdefault(key, {"name": row["name"], "path": row["path"], "pids": [], "cpu": 0.0, "memory": 0, "gpu": 0.0, "disk": 0.0, "net": 0, "hung": False})
+            group["pids"].append(row["pid"]); group["cpu"] += row["cpu"]; group["memory"] += row["memory"]
+            group["gpu"] += row.get("gpu", 0.0); group["net"] += row.get("net", 0); group["hung"] |= row["hung"]
+            group["disk"] = self.disk_names.get(norm_name(row["name"]), 0.0)
         rows = list(groups.values())
-        if self.sort == "priority":
+        if sort == "priority":
             sorter = lambda x: (int(x["hung"]), x["cpu"])
-        elif self.sort == "status":
+        elif sort == "status":
             sorter = lambda x: int(x["hung"])
-        elif self.sort == "name":
+        elif sort == "name":
             sorter = lambda x: x["name"].lower()
         else:
-            sorter = lambda x: x[self.sort]
-        rows.sort(key=sorter, reverse=self.desc)
+            sorter = lambda x: x[sort]
+        rows.sort(key=sorter, reverse=desc)
         old = self.tree.get_children()
         if old: self.tree.delete(*old)
         self.keys = {}
@@ -305,11 +624,18 @@ class App(tk.Tk):
             key = row["name"].lower()
             if key not in self.icons: self.icons[key] = program_icon(row["path"], row["name"])
             tag = "hung" if row["hung"] else "hot" if row["cpu"] >= 25 else ""
-            iid = self.tree.insert("", "end", text="", image=self.icons[key], values=("未响应" if row["hung"] else "正常", row["name"], len(row["pids"]), f"{row['cpu']:.1f}%", pretty_size(row["memory"])), tags=(tag,) if tag else ())
+            values = ("未响应" if row["hung"] else "正常", row["name"], len(row["pids"]), f"{row['cpu']:.1f}%", pretty_size(row["memory"]),
+                      f"{row['gpu']:.0f}%" if row["gpu"] else "--", pretty_speed(row["disk"]), f"{row['net']} 连接")
+            iid = self.tree.insert("", "end", text="", image=self.icons[key], values=values, tags=(tag,) if tag else ())
             self.keys[iid] = key
             if key in selected: self.tree.selection_add(iid)
+        children = self.tree.get_children()
+        if children and not self.tree.selection():
+            index = min(fallback, len(children) - 1)
+            self.tree.selection_set(children[index]); self.tree.focus(children[index]); self.tree.see(children[index])
+        if manual and children:
+            self.tree.selection_set(children[0]); self.tree.focus(children[0]); self.tree.see(children[0])
         self.summary.config(text=f"{len(rows)} 个软件 · 未响应 {sum(x['hung'] for x in rows)} 个 · {'自动刷新中' if self.auto else '仅手动刷新'}")
-        if self.auto: self.job = self.after(1200, self.auto_refresh)
 
     def targets(self):
         result = []
@@ -318,27 +644,38 @@ class App(tk.Tk):
             if values and values[1].lower() != os.path.basename(sys.executable).lower(): result.append((values[1], self.keys.get(item, values[1].lower())))
         return result
 
-    def end(self, targets):
+    def taskkill_all(self, targets):
         mapping = {}
-        for row in self.collect(): mapping.setdefault(row["name"].lower(), []).append(row["pid"])
+        for row in self.last_rows: mapping.setdefault(row["name"].lower(), []).append(row["pid"])
         for _, key in targets:
-            for pid in mapping.get(key, []): subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, creationflags=0x08000000)
+            for pid in mapping.get(key, []):
+                try: subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, timeout=15, creationflags=0x08000000)
+                except subprocess.SubprocessError: pass
 
     def kill_selected(self):
         targets = self.targets()
-        if targets: self.end(targets); self.refresh()
+        if not targets: return
+        threading.Thread(target=self._kill_worker, args=(targets,), daemon=True).start()
+
+    def _kill_worker(self, targets):
+        self.taskkill_all(targets)
+        self.queue.put(("refresh",))
 
     def restart_selected(self):
-        targets = self.targets(); rows = self.collect(); paths = {x["name"].lower(): x["path"] for x in rows}
+        targets = self.targets()
         targets = [(name, key) for name, key in targets if name.lower() not in self.no_restart]
         if not targets: return
-        self.end(targets)
+        paths = {x["name"].lower(): x["path"] for x in self.last_rows}
+        threading.Thread(target=self._restart_worker, args=(targets, paths), daemon=True).start()
+
+    def _restart_worker(self, targets, paths):
+        self.taskkill_all(targets)
         for _, key in targets:
             path = paths.get(key)
             if path and os.path.isfile(path):
                 try: subprocess.Popen([path], creationflags=0x08000000)
                 except OSError: pass
-        self.refresh()
+        self.queue.put(("refresh",))
 
 
 if __name__ == "__main__":
