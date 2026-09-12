@@ -130,6 +130,135 @@ def temp_celsius(raw):
     return max(0.0, min(120.0, celsius)) if celsius is not None else None
 
 
+# ---------------------------------------------------------------------------
+# CPU 型号识别与功耗上限（不再写死某一个型号）
+# 「最大睿频功耗」= Intel 的 Maximum Turbo Power / PL2，AMD 侧取 PPT 上限。
+# 下面只是一张兜底表：表里没有的型号会按后缀估算，而且曲线参考线始终取
+# 「查表值」与「本机实测峰值」中的较大者，所以换任何一台电脑都不会报错。
+# ---------------------------------------------------------------------------
+APP_VERSION = "1.1.0"
+CPU_POWER_TABLE = (
+    # 正则（在清理后的 CPU 名称上做不区分大小写的搜索）      PL1   PL2   系列
+    (r"ultra\s+x?[3579]\s*3\d{2}\s*hx",                    55,  160, "Panther Lake-HX"),
+    (r"ultra\s+x?[3579]\s*3\d{2}\s*h",                     25,   80, "Panther Lake-H"),
+    (r"ultra\s+x?[3579]\s*3\d{2}\s*v",                     17,   37, "Panther Lake-V"),
+    (r"ultra\s+x?[3579]\s*3\d{2}",                         25,   80, "Panther Lake"),
+    (r"ultra\s+[3579]\s*2\d{2}\s*hx",                      55,  160, "Arrow Lake-HX"),
+    (r"ultra\s+9\s*2\d{2}\s*h",                            45,  115, "Arrow Lake-H"),
+    (r"ultra\s+[357]\s*2\d{2}\s*h",                        28,  115, "Arrow Lake-H"),
+    (r"ultra\s+[3579]\s*2\d{2}\s*v",                       17,   37, "Lunar Lake (200V)"),
+    (r"ultra\s+[3579]\s*1\d{2}\s*hx",                      55,  115, "Meteor Lake-HX"),
+    (r"ultra\s+[3579]\s*1\d{2}\s*h",                       28,  115, "Meteor Lake-H"),
+    (r"ultra\s+[3579]\s*[123]\d{2}\s*[uv]",                15,   57, "Core Ultra-U"),
+    (r"core\s+[3579]\s+2\d{2}\s*h",                        45,  115, "Core 200H (Raptor Lake 刷新)"),
+    (r"core\s+[3579]\s+1\d{2}\s*u",                        15,   55, "Core 100U (Raptor Lake 刷新)"),
+    (r"i[3579][- ]1[34]\d{3}\s*hx",                        55,  157, "Raptor Lake-HX"),
+    (r"i[3579][- ]1[34]\d{3}\s*h",                         45,  115, "Raptor Lake-H"),
+    (r"i[3579][- ]1[34]\d{3}\s*p",                         28,   64, "Raptor Lake-P"),
+    (r"i[3579][- ]1[34]\d{3}\s*u",                         15,   55, "Raptor Lake-U"),
+    (r"i[3579][- ]12\d{3}\s*hx",                           55,  157, "Alder Lake-HX"),
+    (r"i[3579][- ]12\d{3}\s*h",                            45,  115, "Alder Lake-H"),
+    (r"i[3579][- ]12\d{2}\s*p",                            28,   64, "Alder Lake-P"),
+    (r"i[3579][- ]1[12]\d{2}\s*u",                         15,   55, "Alder Lake-U"),
+    (r"ryzen\s+ai\s+max",                                  55,  120, "Ryzen AI Max (Strix Halo)"),
+    (r"ryzen\s+ai\s+[3579]",                               28,   54, "Ryzen AI 300 (Strix Point)"),
+    (r"ryzen\s+[3579]\s+\d{4}\s*hx",                       55,   90, "Ryzen HX"),
+    (r"ryzen\s+[3579]\s+\d{4}\s*hs?",                      45,   65, "Ryzen HS/H"),
+    (r"ryzen\s+[3579]\s+\d{4}\s*u",                        15,   28, "Ryzen U"),
+    (r"ryzen",                                             28,   54, "Ryzen 移动版（估算）"),
+)
+
+
+def cpu_brand_string():
+    """读本机 CPU 型号：先查注册表（最快），失败再走 WMI 兜底。"""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DESCRIPTION\System\CentralProcessor\0") as key:
+            name = str(winreg.QueryValueEx(key, "ProcessorNameString")[0]).strip()
+            if name:
+                return name
+    except Exception:
+        pass
+    if win32com is None:
+        return ""
+    try:
+        pythoncom.CoInitialize()
+        try:
+            service = win32com.client.Dispatch("WbemScripting.SWbemLocator").ConnectServer(".", "root\\cimv2")
+            service.Security_.ImpersonationLevel = 3
+            for item in service.ExecQuery("SELECT Name FROM Win32_Processor"):
+                name = str(item.Name).strip()
+                if name:
+                    return name
+        finally:
+            pythoncom.CoUninitialize()
+    except Exception:
+        return ""
+    return ""
+
+
+def clean_cpu_name(raw):
+    name = re.sub(r"\((?:R|TM|C)\)", " ", raw or "", flags=re.I)
+    name = re.sub(r"\bCPU\b", " ", name, flags=re.I)
+    name = re.sub(r"@\s*[\d.]+\s*ghz", " ", name, flags=re.I)  # 老型号尾巴上的 @ 1.60GHz
+    return re.sub(r"\s+", " ", name).strip(" -") or "未知 CPU"
+
+
+def estimate_power_fallback(low):
+    """表里没有的型号：按核心后缀估算；估不出来就把参考线交给本机实测峰值。"""
+    if "ryzen" in low or "amd" in low:
+        return (45, 65, "AMD 后缀估算") if "hx" in low else (28, 54, "AMD 后缀估算")
+    if re.search(r"hx(\s|$)", low): return 55, 157, "HX 后缀估算"
+    if re.search(r"h(\s|$)", low): return 45, 115, "H 后缀估算"
+    if re.search(r"p(\s|$)", low): return 28, 64, "P 后缀估算"
+    if re.search(r"[uvy](\s|$)", low): return 15, 37, "U/V 后缀估算"
+    return 0.0, 0.0, "未收录（参考线用本机实测峰值）"
+
+
+def read_power_override(path):
+    """可选覆盖：脚本目录放 power_limit.txt，内容 `25 80`（基础/最大）或只写 `80`。"""
+    try:
+        with open(path, "r", encoding="utf-8-sig") as handle:
+            text = handle.read()
+    except OSError:
+        return None
+    body = " ".join(line.split("#", 1)[0] for line in text.splitlines())  # 支持 # 注释
+    numbers = [float(value) for value in re.findall(r"\d+(?:\.\d+)?", body)]
+    if not numbers:
+        return None
+    if len(numbers) == 1:
+        return 0.0, numbers[0], "自定义 power_limit.txt"
+    return numbers[0], numbers[1], "自定义 power_limit.txt"
+
+
+def detect_cpu_power(script_dir):
+    """返回 (CPU 名称, 基础功耗, 最大睿频功耗, 依据说明)。"""
+    name = clean_cpu_name(cpu_brand_string())
+    override = read_power_override(os.path.join(script_dir, "power_limit.txt"))
+    if override is not None:
+        pl1, pl2, source = override
+        return name, pl1, pl2, source
+    low = name.lower()
+    for pattern, pl1, pl2, family in CPU_POWER_TABLE:
+        if re.search(pattern, low):
+            return name, float(pl1), float(pl2), family
+    pl1, pl2, source = estimate_power_fallback(low)
+    return name, float(pl1), float(pl2), source
+
+
+def find_sensor(readings, *wanted):
+    """在 RAPL 读数里找传感器：先精确匹配，再按关键字模糊匹配。"""
+    for name in wanted:
+        for key, value in readings.items():
+            if key.lower() == name.lower():
+                return value
+    for name in wanted:
+        for key, value in readings.items():
+            if name.lower() in key.lower():
+                return value
+    return None
+
+
 def system_times():
     idle = wintypes.FILETIME(); kernel = wintypes.FILETIME(); user = wintypes.FILETIME()
     if not kernel32.GetSystemTimes(ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)): return None
@@ -185,6 +314,13 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("极速进程管家")
+        # 自绘图标：让窗口 / 任务栏显示本程序自己的图标（默认是 Tk 的羽毛图标）。
+        try:
+            icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "极速进程管家.ico")
+            if os.path.exists(icon_path):
+                self.iconbitmap(icon_path)
+        except Exception:
+            pass
         self.dpi_scale = max(1.0, self.winfo_fpixels("1i") / 96)
         screen_w, screen_h = self.winfo_screenwidth(), self.winfo_screenheight()
         width = min(int(1280 * self.dpi_scale), screen_w - int(80 * self.dpi_scale))
@@ -206,8 +342,14 @@ class App(tk.Tk):
         self.power_sample = None
         self.power_history = deque(maxlen=180)
         self.power_stop = threading.Event()
+        # 自动识别本机 CPU 型号与官方功耗上限（查表 + 后缀估算 + 实测峰值自适应）
+        self.script_dir = os.path.dirname(os.path.abspath(__file__))
+        self.cpu_name, self.power_base, self.power_limit, self.power_source = detect_cpu_power(self.script_dir)
+        self.learned_peak = 0.0
         self.no_restart = {"svchost.exe", "sihost.exe", "explorer.exe", "shellhost.exe", "searchhost.exe", "startmenuexperiencehost.exe", "runtimebroker.exe", "textinputhost.exe", "lockapp.exe", "unsecapp.exe", "dllhost.exe", "conhost.exe", "splwow64.exe"}
         self.build()
+        if "--power" in sys.argv:  # 命令行加 --power 就直接打开「CPU 实时功耗」标签页
+            self.tabs.select(1)
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.after(120, self.refresh)  # 启动时刷新一次
         self.after(120, self._drain)
@@ -226,6 +368,7 @@ class App(tk.Tk):
         self.network = tk.Label(top, text="↑ --  ↓ --", font=("Microsoft YaHei UI", 10, "bold"), bg="#f4f6f8", fg="#0078d4")
         self.network.pack(side="left", padx=(0, 18))
         tk.Label(top, text="极速进程管家", font=("Microsoft YaHei UI", 17, "bold"), bg="#f4f6f8", fg="#172b4d").pack(side="left")
+        tk.Label(top, text=f"v{APP_VERSION}", font=("Microsoft YaHei UI", 9), bg="#f4f6f8", fg="#8a97a8").pack(side="left", padx=(7, 0), pady=(7, 0))
         self.summary = tk.Label(top, text="正在读取…", font=("Microsoft YaHei UI", 10), bg="#f4f6f8", fg="#536171"); self.summary.pack(side="left", padx=18)
         self.metrics = tk.Label(top, text="CPU --  内存 --  GPU --  NPU --  磁盘 --", font=("Microsoft YaHei UI", 10, "bold"), bg="#f4f6f8", fg="#27364a")
         self.metrics.pack(side="right", padx=(0, 15))
@@ -264,12 +407,12 @@ class App(tk.Tk):
         self.power_cpu_var = tk.StringVar(value="-- %")
         self.power_avg_var = tk.StringVar(value="平均 --.- W")
         self.power_peak_var = tk.StringVar(value="峰值 --.- W")
-        self.power_status_var = tk.StringVar(value="正在连接 Intel RAPL 传感器…")
+        self.power_status_var = tk.StringVar(value="正在连接 RAPL 功耗传感器…")
 
         header = tk.Frame(parent, bg="#f4f6f8", padx=18, pady=14)
         header.pack(fill="x")
         tk.Label(header, text="CPU 实时功耗", font=("Microsoft YaHei UI", 17, "bold"), bg="#f4f6f8", fg="#172b4d").pack(side="left")
-        tk.Label(header, text="Intel Core Ultra 7 258V · 1 秒刷新 · 约 3 分钟历史", font=("Microsoft YaHei UI", 10), bg="#f4f6f8", fg="#687687").pack(side="left", padx=16)
+        tk.Label(header, text=f"{self.cpu_name} · 1 秒刷新 · 约 3 分钟历史", font=("Microsoft YaHei UI", 10), bg="#f4f6f8", fg="#687687").pack(side="left", padx=16)
         ttk.Button(header, text="重置统计", command=self.reset_power_stats).pack(side="right")
 
         cards = tk.Frame(parent, bg="#f4f6f8", padx=14)
@@ -296,7 +439,18 @@ class App(tk.Tk):
         status.pack(fill="x", pady=(0, 12))
         self.power_status_label = tk.Label(status, textvariable=self.power_status_var, font=("Microsoft YaHei UI", 10, "bold"), bg="#f4f6f8", fg="#008b72")
         self.power_status_label.pack(side="left")
-        tk.Label(status, text="数据源：Windows Intel RAPL　｜　258V 官方最大睿频功耗：37W", font=("Microsoft YaHei UI", 9), bg="#f4f6f8", fg="#687687").pack(side="right")
+        tk.Label(status, text=f"数据源：Windows RAPL　｜　{self.limit_caption()}", font=("Microsoft YaHei UI", 9), bg="#f4f6f8", fg="#687687").pack(side="right")
+
+    def limit_caption(self):
+        """底部右侧那句「最大睿频功耗」说明，随本机 CPU 自动变化。"""
+        if self.power_limit <= 0:
+            return "本机 CPU 未收录，参考线取实测峰值"
+        base = f"（基础功耗 {self.power_base:.0f}W）" if self.power_base > 0 else ""
+        return f"最大睿频功耗 {self.power_limit:.0f}W{base}　依据：{self.power_source}"
+
+    def effective_limit(self):
+        """参考线 = 查表值与本机实测峰值中的较大者：型号没收录也不会画错。"""
+        return max(self.power_limit, self.learned_peak)
 
     def _power_card(self, parent, column, title, variable, color):
         frame = tk.Frame(parent, bg="white", highlightbackground="#d7dee8", highlightthickness=1)
@@ -306,7 +460,7 @@ class App(tk.Tk):
 
     def poll_power(self):
         if pythoncom is None or win32com is None:
-            self.queue.put(("power_error", "缺少 pywin32，无法读取 Intel RAPL 功耗传感器"))
+            self.queue.put(("power_error", "缺少 pywin32，无法读取 RAPL 功耗传感器（pip install pywin32）"))
             return
         pythoncom.CoInitialize()
         try:
@@ -321,14 +475,17 @@ class App(tk.Tk):
                     )
                     for item in results:
                         readings[str(item.Name)] = float(item.Power) / 1000.0
-                    package = readings.get("RAPL_Package0_PKG")
+                    # 传感器命名会随平台 / 驱动变化：先找 Package（PKG），再找核心（PP0）与内存（DRAM）
+                    package = find_sensor(readings, "RAPL_Package0_PKG", "PKG")
                     if package is None:
-                        raise RuntimeError("未找到 RAPL_Package0_PKG 传感器")
+                        raise RuntimeError("本机没有可用的 RAPL Package 功耗传感器（非 Intel 平台，或计数器和驱动未启用）")
+                    core = find_sensor(readings, "RAPL_Package0_PP0", "PP0")
+                    dram = find_sensor(readings, "RAPL_Package0_DRAM", "DRAM")
                     sample = (
                         time.time(),
                         package,
-                        readings.get("RAPL_Package0_PP0", 0.0),
-                        readings.get("RAPL_Package0_DRAM", 0.0),
+                        core if core is not None else 0.0,
+                        dram if dram is not None else 0.0,
                     )
                     self.queue.put(("power", sample))
                     self.power_stop.wait(1.0)
@@ -347,10 +504,13 @@ class App(tk.Tk):
         self.power_dram_var.set(f"{dram:.2f} W")
         self.power_cpu_var.set(f"{self.cpu_percent:.0f} %")
         values = [item[1] for item in self.power_history]
+        peak = max(values)
+        if peak > self.power_limit * 1.05:
+            self.learned_peak = peak  # 实测已超过查表值 → 参考线跟着实测走
         self.power_avg_var.set(f"平均 {sum(values) / len(values):.1f} W")
-        self.power_peak_var.set(f"峰值 {max(values):.1f} W")
-        if package >= 35.15:
-            text, color = "接近 37W 官方睿频功耗上限", "#c62828"
+        self.power_peak_var.set(f"峰值 {peak:.1f} W")
+        if self.power_limit > 0 and package >= self.power_limit * 0.95:
+            text, color = f"接近 {self.power_limit:.0f}W 最大睿频功耗上限", "#c62828"
         elif self.cpu_percent >= 80:
             text, color = "高负载运行中", "#d35400"
         elif self.cpu_percent >= 30:
@@ -376,16 +536,20 @@ class App(tk.Tk):
         plot_w, plot_h = max(width - left - right, 10), max(height - top - bottom, 10)
         values = [item[1] for item in self.power_history]
         observed = max(values, default=0.0)
-        y_max = max(40.0, math.ceil(observed / 10.0) * 10.0)
+        limit = self.effective_limit()
+        y_max = max(40.0, math.ceil(max(observed, limit) * 1.1 / 10.0) * 10.0)
 
         for watts in range(0, int(y_max) + 1, 10):
             y = top + plot_h * (1.0 - watts / y_max)
             canvas.create_line(left, y, left + plot_w, y, fill="#e3e8ef")
             canvas.create_text(left - 8, y, text=str(watts), fill="#687687", anchor="e", font=("Microsoft YaHei UI", 8))
 
-        limit_y = top + plot_h * (1.0 - 37.0 / y_max)
-        canvas.create_line(left, limit_y, left + plot_w, limit_y, fill="#d35400", dash=(5, 4))
-        canvas.create_text(left + plot_w - 4, limit_y - 5, text="37W MTP", fill="#d35400", anchor="se", font=("Microsoft YaHei UI", 8, "bold"))
+        if limit > 0:
+            limit_y = top + plot_h * (1.0 - min(limit, y_max) / y_max)
+            canvas.create_line(left, limit_y, left + plot_w, limit_y, fill="#d35400", dash=(5, 4))
+            learned = self.power_limit <= 0 or self.learned_peak > self.power_limit * 1.05
+            caption = f"{limit:.0f}W 实测峰值" if learned else f"{limit:.0f}W MTP"
+            canvas.create_text(left + plot_w - 4, limit_y - 5, text=caption, fill="#d35400", anchor="se", font=("Microsoft YaHei UI", 8, "bold"))
 
         if not values:
             canvas.create_text(width / 2, height / 2, text="等待功耗数据…", fill="#687687", font=("Microsoft YaHei UI", 11))
