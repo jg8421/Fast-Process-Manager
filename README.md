@@ -1,4 +1,4 @@
-# 极速进程管家 v1.1.0
+# 极速进程管家 v1.2.0
 
 轻量 Windows 进程与功耗监控工具。单文件 Python（标准库 + tkinter），双击即用。
 
@@ -9,12 +9,12 @@
 - **Intel RAPL 实时功耗**：CPU Package、CPU 核心、DRAM（**不需要管理员权限**）
 - 平均值、峰值、约 3 分钟滚动曲线，以及一条会自动适应的功耗参考线
 
-## 自动识别本机 CPU（v1.1.0 起）
+## 自动识别本机 CPU（v1.1.0 起，v1.2.0 继续加强）
 
 不再写死某一个型号，换任何一台电脑都能用：
 
 1. 先读注册表 `HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\0\ProcessorNameString`，失败再用 WMI `Win32_Processor` 兜底；
-2. 内置对照表覆盖 Panther Lake / Lunar Lake / Arrow Lake / Meteor Lake / Raptor Lake / Alder Lake / Core Ultra-U / Ryzen 移动版 的基础功耗（PL1）与最大睿频功耗（PL2 / MTP）；
+2. 内置对照表覆盖 Panther Lake / Lunar Lake / Arrow Lake / Meteor Lake / Raptor Lake / Alder Lake / Core Ultra-U / Ryzen 移动版（Ryzen AI Max、Ryzen AI 300、HS/H/U），以及桌面平台（Raptor Lake-K、Alder Lake-K、Ryzen 7000X / 5000X 等）的基础功耗（PL1）与最大睿频功耗（PL2 / MTP）；
 3. 表里没有的型号按核心后缀（HX / H / P / U / V）估算；
 4. 曲线参考线取**「查表值」与「本机实测峰值」中的较大者**：实测超过官方值时参考线自动上移，并标注为「实测峰值」；
 5. 想手工指定？在脚本目录放一个 `power_limit.txt`，内容 `25 80`（基础 / 最大，单位 W），或只写一个数表示最大功耗。
@@ -52,6 +52,9 @@ pythonw process_manager.py --power
 
 ## 更新日志
 
+- **v1.2.0**
+  - 机型适配继续加强：对照表补上桌面平台（Raptor Lake-K / Alder Lake-K / Ryzen 7000X / 5000X 等）；
+  - 某个 RAPL 传感器（核心 / DRAM）读不到时，对应卡片显示 `—`，不再给出误导性的 `0.00 W`。
 - **v1.1.0**
   - CPU 型号与功耗上限自动识别，去掉写死的 `258V / 37W`；
   - RAPL 传感器名动态匹配，兼容不同平台命名；

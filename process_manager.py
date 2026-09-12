@@ -136,7 +136,7 @@ def temp_celsius(raw):
 # 下面只是一张兜底表：表里没有的型号会按后缀估算，而且曲线参考线始终取
 # 「查表值」与「本机实测峰值」中的较大者，所以换任何一台电脑都不会报错。
 # ---------------------------------------------------------------------------
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 CPU_POWER_TABLE = (
     # 正则（在清理后的 CPU 名称上做不区分大小写的搜索）      PL1   PL2   系列
     (r"ultra\s+x?[3579]\s*3\d{2}\s*hx",                    55,  160, "Panther Lake-HX"),
@@ -165,6 +165,13 @@ CPU_POWER_TABLE = (
     (r"ryzen\s+[3579]\s+\d{4}\s*hx",                       55,   90, "Ryzen HX"),
     (r"ryzen\s+[3579]\s+\d{4}\s*hs?",                      45,   65, "Ryzen HS/H"),
     (r"ryzen\s+[3579]\s+\d{4}\s*u",                        15,   28, "Ryzen U"),
+    # 桌面平台（笔记本之外也常见）
+    (r"i[3579][- ]1[34]\d{3}\s*k",                        125,  253, "Raptor Lake-K（桌面）"),
+    (r"i[3579][- ]12\d{3}\s*k",                           125,  241, "Alder Lake-K（桌面）"),
+    (r"ryzen\s+9\s+79\d{2}x",                             170,  230, "Ryzen 7000X（桌面）"),
+    (r"ryzen\s+[3579]\s+5\d{3}x",                         105,  142, "Ryzen 5000X（桌面）"),
+    (r"ryzen\s+[3579]\s+\d{4}x",                          105,  142, "Ryzen X（桌面）"),
+    (r"ryzen\s+[3579]\s+\d{4}",                            65,   88, "Ryzen（桌面估算）"),
     (r"ryzen",                                             28,   54, "Ryzen 移动版（估算）"),
 )
 
@@ -481,12 +488,7 @@ class App(tk.Tk):
                         raise RuntimeError("本机没有可用的 RAPL Package 功耗传感器（非 Intel 平台，或计数器和驱动未启用）")
                     core = find_sensor(readings, "RAPL_Package0_PP0", "PP0")
                     dram = find_sensor(readings, "RAPL_Package0_DRAM", "DRAM")
-                    sample = (
-                        time.time(),
-                        package,
-                        core if core is not None else 0.0,
-                        dram if dram is not None else 0.0,
-                    )
+                    sample = (time.time(), package, core, dram)
                     self.queue.put(("power", sample))
                     self.power_stop.wait(1.0)
                 except Exception as exc:
@@ -500,8 +502,9 @@ class App(tk.Tk):
         self.power_history.append(sample)
         _, package, core, dram = sample
         self.power_package_var.set(f"{package:.1f} W")
-        self.power_core_var.set(f"{core:.1f} W")
-        self.power_dram_var.set(f"{dram:.2f} W")
+        # 有些平台只暴露 Package，或者没有 DRAM 传感器 —— 显示「—」而不是误导性的 0.00 W
+        self.power_core_var.set("—" if core is None else f"{core:.1f} W")
+        self.power_dram_var.set("—" if dram is None else f"{dram:.2f} W")
         self.power_cpu_var.set(f"{self.cpu_percent:.0f} %")
         values = [item[1] for item in self.power_history]
         peak = max(values)
