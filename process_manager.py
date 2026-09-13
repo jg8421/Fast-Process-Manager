@@ -136,7 +136,7 @@ def temp_celsius(raw):
 # 下面只是一张兜底表：表里没有的型号会按后缀估算，而且曲线参考线始终取
 # 「查表值」与「本机实测峰值」中的较大者，所以换任何一台电脑都不会报错。
 # ---------------------------------------------------------------------------
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 CPU_POWER_TABLE = (
     # 正则（在清理后的 CPU 名称上做不区分大小写的搜索）      PL1   PL2   系列
     (r"ultra\s+x?[3579]\s*3\d{2}\s*hx",                    55,  160, "Panther Lake-HX"),
@@ -341,6 +341,11 @@ class App(tk.Tk):
         self.net_sample = None
         self.gpu, self.npu = None, None
         self.temp_cpu, self.temp_gpu = None, None
+        # 温度 / 散热：多源读取 + 静态假传感器识别（见 build_thermal_tab）
+        self.zone_temps, self.zone_precise = {}, {}
+        self.thermal_third, self.thermal_hist = [], deque(maxlen=20)
+        self.temp_trust, self.passive_limit, self.throttle_reasons = "unknown", None, None
+        self.thermal_signature = None
         self.gpu_pids, self.disk_names, self.net_pids = {}, {}, {}
         self.queue = queue.Queue()
         self.collecting = False
@@ -357,6 +362,8 @@ class App(tk.Tk):
         self.build()
         if "--power" in sys.argv:  # 命令行加 --power 就直接打开「CPU 实时功耗」标签页
             self.tabs.select(1)
+        if "--temp" in sys.argv:   # 命令行加 --temp 就直接打开「温度 / 散热」标签页
+            self.tabs.select(2)
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.after(120, self.refresh)  # 启动时刷新一次
         self.after(120, self._drain)
@@ -385,8 +392,10 @@ class App(tk.Tk):
         self.tabs.pack(fill="both", expand=True)
         process_tab = tk.Frame(self.tabs, bg="#f4f6f8")
         power_tab = tk.Frame(self.tabs, bg="#f4f6f8")
+        thermal_tab = tk.Frame(self.tabs, bg="#f4f6f8")
         self.tabs.add(process_tab, text=" 进程管理 ")
         self.tabs.add(power_tab, text=" CPU 实时功耗 ")
+        self.tabs.add(thermal_tab, text=" 温度 / 散热 ")
 
         body = tk.Frame(process_tab, bg="#f4f6f8", padx=16); body.pack(fill="both", expand=True)
         cols = ("status", "name", "count", "cpu", "memory", "gpu", "disk", "net")
@@ -405,6 +414,123 @@ class App(tk.Tk):
         tk.Label(bottom, text="↑/↓ 切换选中，Delete 直接结束；右键可结束或重启；点表头可按 CPU/内存/GPU/磁盘/网络排序。", bg="#f4f6f8", fg="#687687", font=("Microsoft YaHei UI", 9)).pack(side="left")
         self.auto_text = tk.StringVar(value="自动刷新：已关闭"); ttk.Button(bottom, textvariable=self.auto_text, command=self.toggle_auto).pack(side="right")
         self.build_power_tab(power_tab)
+        self.build_thermal_tab(thermal_tab)
+
+    # ------------------------------------------------------------------
+    # 温度 / 散热（多源 + 假传感器识别）
+    # ------------------------------------------------------------------
+    def build_thermal_tab(self, parent):
+        px = lambda value: int(value * self.dpi_scale)
+        self.thermal_main_var = tk.StringVar(value="--")
+        self.thermal_trust_var = tk.StringVar(value="判定中…")
+        self.thermal_power_var = tk.StringVar(value="--.- W")
+        self.thermal_throttle_var = tk.StringVar(value="--")
+
+        header = tk.Frame(parent, bg="#f4f6f8", padx=18, pady=14); header.pack(fill="x")
+        tk.Label(header, text="温度 / 散热", font=("Microsoft YaHei UI", 17, "bold"), bg="#f4f6f8", fg="#172b4d").pack(side="left")
+        tk.Label(header, text="多源读取 · 3 秒刷新 · 自动识别静态假传感器", font=("Microsoft YaHei UI", 10), bg="#f4f6f8", fg="#687687").pack(side="left", padx=16)
+        ttk.Button(header, text="重新判定", command=self.reset_thermal_stats).pack(side="right")
+
+        cards = tk.Frame(parent, bg="#f4f6f8", padx=14); cards.pack(fill="x", pady=(0, 12))
+        for column in range(4):
+            cards.grid_columnconfigure(column, weight=1, uniform="thermal")
+        for column, title, variable, color in (
+            (0, "温度读数", self.thermal_main_var, "#c0392b"),
+            (1, "可信度", self.thermal_trust_var, "#0078d4"),
+            (2, "CPU 封装功耗", self.thermal_power_var, "#008b72"),
+            (3, "降频原因", self.thermal_throttle_var, "#7048a8"),
+        ):
+            card = tk.Frame(cards, bg="white", highlightbackground="#d7dee8", highlightthickness=1)
+            card.grid(row=0, column=column, sticky="nsew", padx=6, pady=4)
+            tk.Frame(card, bg=color, height=3).pack(fill="x")
+            tk.Label(card, text=title, font=("Microsoft YaHei UI", 9), bg="white", fg="#687687").pack(anchor="w", padx=14, pady=(9, 0))
+            tk.Label(card, textvariable=variable, font=("Microsoft YaHei UI", 18, "bold"), bg="white", fg=color).pack(anchor="w", padx=14, pady=(1, 11))
+
+        panel = tk.Frame(parent, bg="white", highlightbackground="#d7dee8", highlightthickness=1)
+        panel.pack(fill="both", expand=True, padx=14, pady=(0, 8))
+        cols = ("source", "instance", "value", "verdict")
+        self.thermal_tree = ttk.Treeview(panel, columns=cols, show="headings", height=8)
+        for key, label, width in (("source", "来源", 260), ("instance", "实例 / 传感器", 300), ("value", "读数", 110), ("verdict", "判定", 240)):
+            self.thermal_tree.heading(key, text=label)
+            self.thermal_tree.column(key, width=px(width), anchor="w" if key != "value" else "e", stretch=key == "instance")
+        self.thermal_tree.pack(fill="both", expand=True, padx=10, pady=10)
+
+        foot = tk.Frame(parent, bg="#f4f6f8", padx=18, pady=6); foot.pack(fill="x")
+        self.thermal_note = tk.Label(foot, text="", justify="left", wraplength=px(1160), bg="#f4f6f8", fg="#687687", font=("Microsoft YaHei UI", 9))
+        self.thermal_note.pack(anchor="w")
+
+    def reset_thermal_stats(self):
+        self.thermal_hist.clear()
+        self.temp_trust = "unknown"
+        self.thermal_signature = None
+        self.refresh_thermal_view()
+
+    def _judge_thermal(self):
+        """区分真温度与「固件没接线」的静态假传感器：温度纹丝不动而负载大幅波动 = 假。"""
+        if self.thermal_third:
+            return "reliable"
+        if self.temp_cpu is None:
+            return "absent"
+        if len(self.thermal_hist) < 8:
+            return "unknown"
+        temps = [item[0] for item in self.thermal_hist]
+        loads = [item[1] for item in self.thermal_hist]
+        if max(temps) - min(temps) < 0.3 and max(loads) - min(loads) > 25:
+            return "static"
+        return "reliable"
+
+    def decode_throttle(self, bits):
+        try:
+            value = int(float(bits))
+        except (TypeError, ValueError):
+            return "--"
+        if value == 0:
+            return "无降频"
+        names = {0: "温度", 1: "功耗", 2: "电流", 3: "其他"}
+        hit = [name for bit, name in sorted(names.items()) if value & (1 << bit)]
+        text = " / ".join(hit) if hit else "未知位"
+        return f"{text} (0x{value:X})"
+
+    def refresh_thermal_view(self):
+        if not hasattr(self, "thermal_tree"):
+            return
+        verdicts = {"reliable": "可信（随负载变化）", "static": "静态 · 疑似假传感器", "absent": "无可用温度源", "unknown": "判定中…"}
+        self.thermal_main_var.set("--" if self.temp_cpu is None else f"{self.temp_cpu:.1f} °C")
+        self.thermal_trust_var.set(verdicts.get(self.temp_trust, "判定中…"))
+        package = self.power_sample[1] if self.power_sample else None
+        self.thermal_power_var.set("--.- W" if package is None else f"{package:.1f} W")
+        self.thermal_throttle_var.set("--" if self.throttle_reasons is None else self.decode_throttle(self.throttle_reasons))
+
+        rows = []
+        for instance, value in sorted(self.zone_temps.items()):
+            rows.append(("ACPI 热区 · Temperature", instance, f"{value:.1f} °C", verdicts.get(self.temp_trust, "")))
+        for instance, value in sorted(self.zone_precise.items()):
+            rows.append(("ACPI 热区 · High Precision", instance, f"{value:.1f} °C", verdicts.get(self.temp_trust, "")))
+        for monitor, name, value in self.thermal_third:
+            rows.append((f"第三方监控 · {monitor}", name, f"{value:.1f} °C", "可信（硬件直读）"))
+        if self.passive_limit is not None:
+            rows.append(("ACPI 被动散热限制", "% Passive Limit", f"{self.passive_limit:.0f} %", "越高越受散热限制"))
+        if self.throttle_reasons is not None:
+            rows.append(("ACPI 降频原因", "Throttle Reasons", f"0x{int(self.throttle_reasons):X}", self.decode_throttle(self.throttle_reasons)))
+
+        signature = tuple(rows)
+        if signature != self.thermal_signature:
+            self.thermal_signature = signature
+            self.thermal_tree.delete(*self.thermal_tree.get_children())
+            if rows:
+                for row in rows:
+                    self.thermal_tree.insert("", "end", values=row)
+            else:
+                self.thermal_tree.insert("", "end", values=("—", "本机没有可读的温度传感器", "—", "—"))
+
+        if self.thermal_third:
+            self.thermal_note.configure(text="已检测到第三方硬件监控（LibreHardwareMonitor / OpenHardwareMonitor），温度取硬件直读值。", fg="#008b72")
+        elif self.temp_trust == "static":
+            self.thermal_note.configure(text="⚠ 本机固件只暴露一个 ACPI 热区，且已实测：CPU 封装功耗从 13 W 拉到 62 W 时它恒为 27.9 °C —— 属于「假传感器」，不能当 CPU 温度用。要拿真实 CPU 温度需装 LibreHardwareMonitor（或 HWiNFO），本程序会自动识别并优先采用。注意：下方的「封装功耗 / 被动散热限制 / 降频原因」不受影响，仍可判断机器是否正在热限。", fg="#c0392b")
+        elif self.temp_trust == "absent":
+            self.thermal_note.configure(text="本机没有可读的温度传感器。可安装 LibreHardwareMonitor 后重启本程序，温度会自动出现。", fg="#c0392b")
+        else:
+            self.thermal_note.configure(text="温度源：Windows ACPI 热区（\\Thermal Zone Information）。若读数不随负载变化，点「重新判定」再观察 30 秒。", fg="#687687")
 
     def build_power_tab(self, parent):
         px = lambda value: int(value * self.dpi_scale)
@@ -620,7 +746,7 @@ class App(tk.Tk):
     def poll_accelerators(self):
         """GPU/NPU/温度/磁盘/网络等计数器在后台线程轮询，避免阻塞界面。"""
         command = """$o = New-Object System.Collections.Generic.List[string]
-$paths = '\\GPU Engine(*)\\Utilization Percentage','\\NPU Engine(*)\\Utilization Percentage','\\Thermal Zone Information(*)\\Temperature','\\GPU Adapter Temperature(*)','\\Process(*)\\IO Data Bytes/sec'
+$paths = '\\GPU Engine(*)\\Utilization Percentage','\\NPU Engine(*)\\Utilization Percentage','\\GPU Adapter Temperature(*)','\\Process(*)\\IO Data Bytes/sec'
 foreach ($x in $paths) {
   $rr = $null
   try { $rr = Get-Counter $x -ErrorAction Stop } catch { }
@@ -641,6 +767,22 @@ foreach ($x in $paths) {
     }
   }
 }
+try {
+  Get-CimInstance -ClassName Win32_PerfFormattedData_Counters_ThermalZoneInformation -ErrorAction Stop | ForEach-Object {
+    $inst = if ($_.InstanceName) { $_.InstanceName } else { $_.Name }
+    $o.Add(('TZ|{0}|{1}' -f $inst, $_.Temperature))
+    if ($_.HighPrecisionTemperature -gt 0) { $o.Add(('HP|{0}|{1}' -f $inst, $_.HighPrecisionTemperature)) }
+    $o.Add(('PL|{0}|{1}' -f $inst, $_.PercentPassiveLimit))
+    $o.Add(('TR|{0}|{1}' -f $inst, $_.ThrottleReasons))
+  }
+} catch { }
+foreach ($ns in 'root\\LibreHardwareMonitor','root\\OpenHardwareMonitor') {
+  try {
+    Get-CimInstance -Namespace $ns -ClassName Sensor -ErrorAction Stop | Where-Object { $_.SensorType -eq 'Temperature' } | ForEach-Object {
+      $o.Add(('3|{0}|{1}|{2}' -f $ns.Substring(5), $_.Name, $_.Value))
+    }
+  } catch { }
+}
 $c = @{}
 Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue | ForEach-Object { if ($_.OwningProcess) { $c[$_.OwningProcess] = 1 + $c[$_.OwningProcess] } }
 Get-NetUDPEndpoint -ErrorAction SilentlyContinue | ForEach-Object { if ($_.OwningProcess) { $c[$_.OwningProcess] = 1 + $c[$_.OwningProcess] } }
@@ -648,7 +790,7 @@ foreach ($k in $c.Keys) { $o.Add(('N|{0}|{1}' -f $k, $c[$k])) }
 $o"""
         while True:
             try:
-                result = subprocess.run(["powershell.exe", "-NoProfile", "-Command", command], capture_output=True, text=True, timeout=12, creationflags=0x08000000)
+                result = subprocess.run(["powershell.exe", "-NoProfile", "-Command", command], capture_output=True, text=True, timeout=20, creationflags=0x08000000)
                 self._parse_counters(result.stdout)
             except (OSError, ValueError, subprocess.SubprocessError):
                 pass
@@ -657,6 +799,7 @@ $o"""
     def _parse_counters(self, stdout):
         gpu, npu, disk, net = {}, [], {}, {}
         thermals, gtemps = [], []
+        zones, precise, third = {}, {}, []
         for line in stdout.splitlines():
             parts = line.split("|")
             if not parts: continue
@@ -667,6 +810,11 @@ $o"""
                 elif parts[0] == "V": gtemps.append(float(parts[1]))
                 elif parts[0] == "D": disk[parts[1]] = disk.get(parts[1], 0.0) + float(parts[2])
                 elif parts[0] == "N": net[int(parts[1])] = net.get(int(parts[1]), 0) + int(parts[2])
+                elif parts[0] == "TZ": zones[parts[1]] = temp_celsius(parts[2])
+                elif parts[0] == "HP": precise[parts[1]] = temp_celsius(parts[2])
+                elif parts[0] == "PL": self.passive_limit = float(parts[2])
+                elif parts[0] == "TR": self.throttle_reasons = float(parts[2])
+                elif parts[0] == "3": third.append((parts[1], parts[2], max(0.0, min(120.0, float(parts[3])))))
             except (ValueError, IndexError):
                 continue
         self.gpu_pids, self.disk_names, self.net_pids = gpu, disk, net
@@ -676,6 +824,22 @@ $o"""
         self.temp_cpu = max(temps) if temps else None
         valid = [max(0.0, min(120.0, x)) for x in gtemps]
         self.temp_gpu = max(valid) if valid else None
+        # ---- 温度 / 散热：记录多源读数并判定真假传感器 ----
+        legacy = []
+        if thermals:  # 兼容旧的 T| 行（原始为开尔文）
+            legacy = [temp_celsius(x) for x in thermals]
+            legacy = [x for x in legacy if x is not None]
+        candidates = legacy + [v for v in zones.values() if v is not None]
+        if candidates:
+            self.temp_cpu = max(candidates)
+        self.zone_temps = {k: v for k, v in zones.items() if v is not None}
+        self.zone_precise = {k: v for k, v in precise.items() if v is not None}
+        self.thermal_third = third
+        if third:  # 第三方监控（LibreHardwareMonitor / OpenHardwareMonitor）优先
+            self.temp_cpu = max(x[2] for x in third)
+        if self.temp_cpu is not None:
+            self.thermal_hist.append((self.temp_cpu, self.cpu_percent))
+        self.temp_trust = self._judge_thermal()
 
     def update_metrics(self):
         now = time.perf_counter(); current = system_times(); cpu_text = "--"
@@ -704,9 +868,13 @@ $o"""
         gpu_text = f"{self.gpu:.0f}%" if self.gpu is not None else "--"
         npu_text = f"{self.npu:.0f}%" if self.npu is not None else "--"
         cpu_temp = f"{self.temp_cpu:.0f}°C" if self.temp_cpu is not None else "--"
+        if self.temp_cpu is not None:
+            if self.temp_trust == "static": cpu_temp += "(静态·不可信)"
+            elif self.temp_trust == "reliable": cpu_temp += "(可信)"
         gpu_temp = f"{self.temp_gpu:.0f}°C" if self.temp_gpu is not None else "--"
         power_text = f"{self.power_sample[1]:.1f}W" if self.power_sample else "--"
         self.metrics.config(text=f"CPU {cpu_text}  功耗 {power_text}  内存 {memory_text}  GPU {gpu_text}  NPU {npu_text}  磁盘 {disk_text}  CPU温 {cpu_temp}  GPU温 {gpu_temp}")
+        self.refresh_thermal_view()
         self.after(1000, self.update_metrics)
 
     def collect(self):
