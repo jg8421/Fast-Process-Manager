@@ -1,4 +1,4 @@
-# 极速进程管家 v1.3.0
+# 极速进程管家 v1.4.0
 
 轻量 Windows 进程与功耗监控工具。单文件 Python（标准库 + tkinter），双击即用。
 
@@ -7,17 +7,25 @@
 - 分组查看进程，未响应置顶，可直接结束或重启
 - CPU、内存、GPU、NPU、磁盘、网络、温度总览
 - **Intel RAPL 实时功耗**：CPU Package、CPU 核心、DRAM（**不需要管理员权限**）
-- **温度 / 散热页**：多源温度读取 + 假传感器识别 + 散热限制与降频原因
+- **温度 / 散热页**：真实硬件温度按区域读取 + ACPI 热区独立参考 + 散热限制与降频原因
 - 平均值、峰值、约 3 分钟滚动曲线，以及一条会自动适应的功耗参考线
 
-## 温度 / 散热（v1.3.0 新增）
+## 真实读数与区域分类（v1.4.0）
+
+- 温度与功耗按 CPU 封装、CPU 核心、GPU、主板 / 机身、存储及其他区域分开，明细保留来源与传感器身份。
+- **CPU 温度只取 CPU 硬件传感器**，不再把 GPU / SSD 最高温或 ACPI 热区冒充 CPU 温度；ACPI 热区仅作未验证参考，随负载变化也不能证明它是 CPU。
+- **CPU 封装功耗不是整机功耗**；核心功耗是封装的一部分，不能叠加。CPU 平台功率（RAPL PSYS）另设卡片，代表硬件平台域，不当成插座整机输入。整机功耗仅接受明确的系统总功率传感器，不把 CPU、GPU、DRAM 相加作为整机实测。
+- 不支持的指标显示未提供；无效或断连读数清空，不钳位成 0、不保留旧值冒充实时。
+- 真实温度需要支持本机处理器的 [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) / OpenHardwareMonitor 运行并提供 WMI；硬件访问通常需要正常管理员权限。新处理器若稳定版未支持，应使用官方支持该处理器的版本，而不是估算温度。
+- 机身没有统一的“整机温度”，应查看主板、机身或各部件传感器；没有系统功率计的机器不能凭软件获得真实插座整机功耗。
+
+## 温度 / 散热（历史 v1.3.0）
 
 顶部标签页「温度 / 散热」，命令行加 `--temp` 可直接打开。
 
-- **四张卡片**：温度读数、可信度、CPU 封装功耗（RAPL）、降频原因。
-- **明细表**：每个传感器的来源、实例名、读数、判定；同时列出 `% Passive Limit`（被动散热限制）与 `Throttle Reasons`（降频原因，按位解码成「温度 / 功耗 / 电流 / 其他」）。
-- **静态假传感器识别**：连续采样对比「温度变化」与「CPU 负载变化」——若温度纹丝不动（跨度 < 0.3 °C）而负载大幅波动（跨度 > 25%），判定为 **静态 · 疑似假传感器**，顶栏显示 `CPU温 28°C(静态·不可信)`，不再把假值当真温度。
-- **真实 CPU 温度**：自动探测 `root\LibreHardwareMonitor` 与 `root\OpenHardwareMonitor`。装了 [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) 并开启其 WMI 提供程序后，本程序会优先采用硬件直读温度（判定显示「可信（硬件直读）」）。
+- **卡片与明细**：CPU 硬件温度及类型、CPU 封装功耗、降频信息；GPU 及主板 / 机身温度按区域列入明细，整机功率卡片在功耗页。ACPI 热区独立列出。
+- **ACPI 热区**：仅参考，不论读数是否静态，都不能据此认定为真实 CPU 温度。
+- **真实 CPU 温度**：自动探测 `root\LibreHardwareMonitor` 与 `root\OpenHardwareMonitor`，按硬件身份选择 CPU 封装温度，缺少封装传感器时显示 CPU 核心最高值。
 - 为什么需要这一步：不少笔记本（实测 REDMI Book Pro 16 2026 / Panther Lake）固件只暴露**一个** ACPI 热区，而且读数**恒定**——CPU 封装功耗从 13 W 拉到 62 W，它始终是 27.9 °C。这不是程序读错，是硬件没提供；本程序会明确标注，而不是伪造一个会动的数字。
 
 ## 自动识别本机 CPU（v1.1.0 起，v1.2.0 继续加强）
@@ -49,7 +57,9 @@ pythonw process_manager.py --temp
 ```
 
 - Python 3.10+（需要自带 tkinter 的官方发行版）；
-- `pywin32` 仅用于读取 RAPL 功耗传感器，缺了不影响进程管理功能。
+- `pywin32` 用于读取 RAPL / WMI 功耗传感器，缺了不影响进程管理功能。
+- 经典 LHM / OHM：可在安装目录的 `hardware_monitor_path.txt` 写硬件监控程序绝对路径；启动时无 WMI 提供程序则正常请求管理员启动一次，不改变进程管家快捷方式。
+- 新版 LHM 若不再提供 WMI，可通过本地官方库传感器桥接读取。安装目录放 `hardware_sensor_bridge.json`，内容为 `{"script_path":"桥接脚本绝对路径.ps1","snapshot_path":"传感器快照绝对路径.json"}`；桥接程序正常请求管理员权限，取消不重试。快照必须带真实采样时间，超过 15 秒不再使用。此配置不进入 Git。桥接脚本 `sensor-bridge.ps1` 放到官方 LHM 二进制目录（与 `LibreHardwareMonitorLib.dll` 同目录），默认每秒生成 `sensor-snapshot.json`；正常管理员运行，不绕过执行策略。创建同目录 `sensor-bridge.stop` 可正常停止，重启前移除该停止标记。桥接不改系统限频、功率限制或快捷方式。
 
 ## 功耗读数说明
 
@@ -60,9 +70,16 @@ pythonw process_manager.py --temp
 
 ## 温度读数说明（v1.3.0）
 
-- 数据源按顺序尝试：① LibreHardwareMonitor / OpenHardwareMonitor 的 WMI 传感器（真值，优先）→ ② `Win32_PerfFormattedData_Counters_ThermalZoneInformation`（ACPI 热区，一次调用约 13 ms）；
-- 采样与进程/GPU 指标同一线程，每 3 秒一轮，不额外常驻进程；
-- 判定逻辑只做「是否随负载变化」这一件事，不猜测、不外推，读不到就显示「--」或「无可用温度源」。
+- CPU / GPU 温度来自 LibreHardwareMonitor / OpenHardwareMonitor 的 WMI 硬件传感器，按所属硬件分类；`Win32_PerfFormattedData_Counters_ThermalZoneInformation` 仅列为 ACPI 热区参考；
+- 传感器采样后台运行，结果经主线程队列更新界面，约每 3 秒一轮（另需硬件监控提供程序运行）；
+- 不猜测、不外推，读不到就显示「未提供」，读取失败或过期不再保留旧实时读数。
+
+## 回归测试
+
+```bat
+python -m unittest test_sensors -v
+python -m py_compile process_manager.py
+```
 
 ## 使用提示
 
@@ -71,6 +88,12 @@ pythonw process_manager.py --temp
 
 ## 更新日志
 
+- **v1.4.0**
+  - 修复 GPU / SSD 温度被当作 CPU 温度，硬件归属分类后分区展示温度与功耗；
+  - ACPI 热区永远只作参考，不再因随负载变化自动判定为真实 CPU 温度；
+  - 整机功耗单列，无系统功率传感器时明确未提供，不以部件加总冒充；
+  - 后台结果经队列回主线程更新，传感器无效 / 断连时清除旧值；
+  - 增加离线传感器回归测试。
 - **v1.3.0**
   - 新增「温度 / 散热」标签页（`--temp`）：温度读数 / 可信度 / 封装功耗 / 降频原因四张卡片 + 传感器明细表（含 `% Passive Limit`、`Throttle Reasons`）；
   - **静态假传感器识别**：温度不随负载变化时标注为「静态 · 疑似假传感器」，顶栏显示 `(静态·不可信)`，不再把假值当真温度；

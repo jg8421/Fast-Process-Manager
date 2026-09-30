@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ctypes
+import json
 from ctypes import wintypes
 from collections import deque
 import math
@@ -123,11 +124,146 @@ def norm_name(name):
     return key[:-4] if key.endswith(".exe") else key
 
 
+def finite_sensor_value(raw):
+    """Actual sensor value, without clamping or replacing missing readings with zero."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return value if math.isfinite(value) else None
+
+
 def temp_celsius(raw):
-    try: value = float(raw)
-    except (TypeError, ValueError): return None
-    celsius = value / 10 - 273.15 if 1500 <= value <= 4500 else value - 273.15 if 250 <= value <= 500 else None
-    return max(0.0, min(120.0, celsius)) if celsius is not None else None
+    value = finite_sensor_value(raw)
+    if value is None:
+        return None
+    return value / 10 - 273.15 if 1500 <= value <= 4500 else value - 273.15 if 250 <= value <= 500 else None
+
+
+def classify_sensor(sensor, hardware=()):
+    """Classify WMI records by hardware ancestry, never by global temperature maxima."""
+    value = finite_sensor_value(sensor.get("Value", sensor.get("value")))
+    sensor_type = str(sensor.get("SensorType", "")).lower()
+    if value is None or sensor_type not in ("temperature", "power"):
+        return None
+    identifier = str(sensor.get("Identifier", ""))
+    parent = str(sensor.get("Parent", ""))
+    name = str(sensor.get("Name", ""))
+    lookup = {str(h.get("Identifier", "")): h for h in hardware}
+    ancestry, seen = [], set()
+    current = parent
+    while current and current not in seen:
+        seen.add(current)
+        h = lookup.get(current)
+        if not h:
+            break
+        ancestry.append(h)
+        current = str(h.get("Parent", ""))
+    types = " ".join(str(h.get("HardwareType", "")) for h in ancestry)
+    identity = (types + " " + parent + " " + identifier).lower()
+    low = name.lower()
+    if "acpi" in identity or "thermalzone" in identity or "thermal zone" in low:
+        region = "system"
+    elif re.search(r"gpu|nvidia|radeon|/ati/", identity):
+        region = "gpu"
+    elif re.search(r"cpu|intelcpu|amdcpu", identity):
+        region = "cpu"
+    elif re.search(r"storage|hdd|ssd|nvme", identity):
+        region = "storage"
+    elif re.search(r"motherboard|superio|superi/o|mainboard|lpc|embeddedcontroller|/ec/", identity):
+        region = "system"
+    else:
+        region = "other"
+    kind = "other"
+    if region == "cpu":
+        kind = "cpu_package" if re.search(r"package|\bpkg\b|tctl|tdie", low) else "cpu_core" if "core" in low else "cpu_other"
+    # Explicit whole-system names only; component package/total names are not system input.
+    if sensor_type == "power" and region not in ("cpu", "gpu", "storage") and re.fullmatch(r"(?:total system(?: power)?|system power|system total(?: power)?|whole system(?: power)?)", low.strip()):
+        region, kind = "system", "system_total"
+    if sensor.get("Kind") == "battery_discharge" and sensor_type == "power":
+        region, kind = "system", "battery_discharge"
+    return {"source": str(sensor.get("Source", "")), "name": name,
+            "identifier": identifier, "parent": parent, "hardware_type": types,
+            "region": region, "kind": kind, "sensor_type": sensor_type, "value": value}
+
+
+def parse_sensor_payload(payload, hardware=(), source=""):
+    records = []
+    for sensor in payload:
+        item = dict(sensor)
+        item.setdefault("Source", source)
+        record = classify_sensor(item, hardware)
+        if record is not None:
+            records.append(record)
+    return records
+
+
+def summarize_sensors(records):
+    def values(region, sensor_type, kind=None):
+        return [r["value"] for r in records if r["region"] == region and r["sensor_type"] == sensor_type and (kind is None or r["kind"] == kind)]
+    packages = values("cpu", "temperature", "cpu_package")
+    cores = values("cpu", "temperature", "cpu_core")
+    gpu = values("gpu", "temperature")
+    def first(region, kind):
+        matches = values(region, "power", kind)
+        return matches[0] if matches else None
+    dram = [r["value"] for r in records if r["sensor_type"] == "power" and r["region"] == "cpu" and re.search(r"dram|memory", r["name"], re.I)]
+    return {"cpu_temperature": max(packages) if packages else max(cores) if cores else None,
+            "cpu_temperature_kind": "cpu_package" if packages else "cpu_core" if cores else None,
+            "gpu_temperature": max(gpu) if gpu else None,
+            "system_power": first("system", "system_total"),
+            "cpu_package_power": first("cpu", "cpu_package"),
+            "cpu_core_power": first("cpu", "cpu_core"),
+            "dram_power": dram[0] if dram else None}
+
+
+def read_bridge_config(script_dir):
+    """Read an explicitly configured local PowerShell sensor bridge; no downloads."""
+    try:
+        with open(os.path.join(script_dir, "hardware_sensor_bridge.json"), encoding="utf-8-sig") as stream:
+            config = json.load(stream)
+        script = str(config["script_path"])
+        snapshot = str(config["snapshot_path"])
+        script = os.path.abspath(script if os.path.isabs(script) else os.path.join(script_dir, script))
+        snapshot = os.path.abspath(snapshot if os.path.isabs(snapshot) else os.path.join(script_dir, snapshot))
+        if not script.lower().endswith(".ps1") or not os.path.isfile(script):
+            return None
+        return {"script_path": script, "snapshot_path": snapshot}
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+
+
+def read_bridge_sensors(script_dir):
+    """Read finite hardware-identified values only from a fresh (0..15s) snapshot."""
+    config = read_bridge_config(script_dir)
+    if config is None:
+        return []
+    try:
+        with open(config["snapshot_path"], encoding="utf-8-sig") as stream:
+            payload = json.load(stream)
+        stamp = finite_sensor_value(payload.get("Timestamp"))
+        if stamp is None or not 0 <= time.time() - stamp <= 15:
+            return []
+        return parse_sensor_payload(payload.get("Sensors", []), payload.get("Hardware", []), payload.get("Source", "LibreHardwareMonitor官方库"))
+    except (OSError, ValueError, TypeError, AttributeError):
+        # A partially written snapshot is unavailable, never an excuse to retain stale data.
+        return []
+
+
+def read_monitor_sensors(locator):
+    """Read fresh LHM/OHM hardware identities and actual Temperature/Power values."""
+    records = []
+    for namespace in ("LibreHardwareMonitor", "OpenHardwareMonitor"):
+        try:
+            service = locator.ConnectServer(".", "root\\" + namespace)
+            hardware = [{key: getattr(h, key, "") for key in ("Identifier", "Parent", "HardwareType", "Name")} for h in service.ExecQuery("SELECT * FROM Hardware")]
+            sensors = [{key: getattr(item, key, None) for key in ("Name", "Identifier", "Parent", "SensorType", "Value")} for item in service.ExecQuery("SELECT * FROM Sensor WHERE SensorType='Temperature' OR SensorType='Power'")]
+            records.extend(parse_sensor_payload(sensors, hardware, namespace))
+        except Exception:
+            continue
+    return records
 
 
 # ---------------------------------------------------------------------------
@@ -136,7 +272,7 @@ def temp_celsius(raw):
 # 下面只是一张兜底表：表里没有的型号会按后缀估算，而且曲线参考线始终取
 # 「查表值」与「本机实测峰值」中的较大者，所以换任何一台电脑都不会报错。
 # ---------------------------------------------------------------------------
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 CPU_POWER_TABLE = (
     # 正则（在清理后的 CPU 名称上做不区分大小写的搜索）      PL1   PL2   系列
     (r"ultra\s+x?[3579]\s*3\d{2}\s*hx",                    55,  160, "Panther Lake-HX"),
@@ -341,6 +477,11 @@ class App(tk.Tk):
         self.net_sample = None
         self.gpu, self.npu = None, None
         self.temp_cpu, self.temp_gpu = None, None
+        self.sensor_records = []
+        self.power_records = []
+        self.cpu_temperature_kind = None
+        self.last_sensor_at = 0.0
+        self.last_power_at = 0.0
         # 温度 / 散热：多源读取 + 静态假传感器识别（见 build_thermal_tab）
         self.zone_temps, self.zone_precise = {}, {}
         self.thermal_third, self.thermal_hist = [], deque(maxlen=20)
@@ -371,6 +512,7 @@ class App(tk.Tk):
         self.after(300, self.tree.focus_set)
         threading.Thread(target=self.poll_accelerators, daemon=True).start()
         threading.Thread(target=self.poll_power, daemon=True).start()
+        threading.Thread(target=self.check_monitor_companion, daemon=True).start()
 
     def build(self):
         px = lambda value: int(value * self.dpi_scale)
@@ -428,15 +570,15 @@ class App(tk.Tk):
 
         header = tk.Frame(parent, bg="#f4f6f8", padx=18, pady=14); header.pack(fill="x")
         tk.Label(header, text="温度 / 散热", font=("Microsoft YaHei UI", 17, "bold"), bg="#f4f6f8", fg="#172b4d").pack(side="left")
-        tk.Label(header, text="多源读取 · 3 秒刷新 · 自动识别静态假传感器", font=("Microsoft YaHei UI", 10), bg="#f4f6f8", fg="#687687").pack(side="left", padx=16)
+        tk.Label(header, text="按硬件区域读取 · 温度与功耗明细 · ACPI 不代表 CPU", font=("Microsoft YaHei UI", 10), bg="#f4f6f8", fg="#687687").pack(side="left", padx=16)
         ttk.Button(header, text="重新判定", command=self.reset_thermal_stats).pack(side="right")
 
         cards = tk.Frame(parent, bg="#f4f6f8", padx=14); cards.pack(fill="x", pady=(0, 12))
         for column in range(4):
             cards.grid_columnconfigure(column, weight=1, uniform="thermal")
         for column, title, variable, color in (
-            (0, "温度读数", self.thermal_main_var, "#c0392b"),
-            (1, "可信度", self.thermal_trust_var, "#0078d4"),
+            (0, "CPU 温度", self.thermal_main_var, "#c0392b"),
+            (1, "CPU 温度类型", self.thermal_trust_var, "#0078d4"),
             (2, "CPU 封装功耗", self.thermal_power_var, "#008b72"),
             (3, "降频原因", self.thermal_throttle_var, "#7048a8"),
         ):
@@ -450,7 +592,7 @@ class App(tk.Tk):
         panel.pack(fill="both", expand=True, padx=14, pady=(0, 8))
         cols = ("source", "instance", "value", "verdict")
         self.thermal_tree = ttk.Treeview(panel, columns=cols, show="headings", height=8)
-        for key, label, width in (("source", "来源", 260), ("instance", "实例 / 传感器", 300), ("value", "读数", 110), ("verdict", "判定", 240)):
+        for key, label, width in (("source", "区域 / 来源", 260), ("instance", "实例 / 传感器", 300), ("value", "读数", 110), ("verdict", "硬件身份 / 类型", 240)):
             self.thermal_tree.heading(key, text=label)
             self.thermal_tree.column(key, width=px(width), anchor="w" if key != "value" else "e", stretch=key == "instance")
         self.thermal_tree.pack(fill="both", expand=True, padx=10, pady=10)
@@ -466,18 +608,8 @@ class App(tk.Tk):
         self.refresh_thermal_view()
 
     def _judge_thermal(self):
-        """区分真温度与「固件没接线」的静态假传感器：温度纹丝不动而负载大幅波动 = 假。"""
-        if self.thermal_third:
-            return "reliable"
-        if self.temp_cpu is None:
-            return "absent"
-        if len(self.thermal_hist) < 8:
-            return "unknown"
-        temps = [item[0] for item in self.thermal_hist]
-        loads = [item[1] for item in self.thermal_hist]
-        if max(temps) - min(temps) < 0.3 and max(loads) - min(loads) > 25:
-            return "static"
-        return "reliable"
+        # ACPI and load correlation never establish a CPU temperature identity.
+        return "identified" if self.temp_cpu is not None else "absent"
 
     def decode_throttle(self, bits):
         try:
@@ -494,47 +626,42 @@ class App(tk.Tk):
     def refresh_thermal_view(self):
         if not hasattr(self, "thermal_tree"):
             return
-        verdicts = {"reliable": "可信（随负载变化）", "static": "静态 · 疑似假传感器", "absent": "无可用温度源", "unknown": "判定中…"}
-        self.thermal_main_var.set("--" if self.temp_cpu is None else f"{self.temp_cpu:.1f} °C")
-        self.thermal_trust_var.set(verdicts.get(self.temp_trust, "判定中…"))
+        self.thermal_main_var.set("未提供" if self.temp_cpu is None else f"{self.temp_cpu:.1f} °C")
+        self.thermal_trust_var.set({"cpu_package": "CPU 封装", "cpu_core": "CPU 核心最高值"}.get(self.cpu_temperature_kind, "未提供"))
         package = self.power_sample[1] if self.power_sample else None
-        self.thermal_power_var.set("--.- W" if package is None else f"{package:.1f} W")
+        self.thermal_power_var.set("未提供" if package is None else f"{package:.1f} W")
         self.thermal_throttle_var.set("--" if self.throttle_reasons is None else self.decode_throttle(self.throttle_reasons))
-
         rows = []
+        regions = {"cpu": "核心处理器 CPU", "gpu": "GPU", "system": "主板 / 机身 / 系统", "storage": "存储", "other": "其他"}
+        records = [r for r in self.sensor_records if r["sensor_type"] == "temperature"] + self.power_records
+        for region in regions:
+            for r in records:
+                if r["region"] != region:
+                    continue
+                unit = "°C" if r["sensor_type"] == "temperature" else "W"
+                label = "电池放电功率（非插电整机输入）" if r["kind"] == "battery_discharge" else r["name"]
+                rows.append((f"{regions[region]} · {r['source']}", label, f"{r['value']:.1f} {unit}", f"{r['kind']} · {r['hardware_type']} · {r['parent']} · {r['identifier']}"))
         for instance, value in sorted(self.zone_temps.items()):
-            rows.append(("ACPI 热区 · Temperature", instance, f"{value:.1f} °C", verdicts.get(self.temp_trust, "")))
+            rows.append(("主板 / 系统 · ACPI 热区", instance, f"{value:.1f} °C", "固件热区；不是 CPU 温度"))
         for instance, value in sorted(self.zone_precise.items()):
-            rows.append(("ACPI 热区 · High Precision", instance, f"{value:.1f} °C", verdicts.get(self.temp_trust, "")))
-        for monitor, name, value in self.thermal_third:
-            rows.append((f"第三方监控 · {monitor}", name, f"{value:.1f} °C", "可信（硬件直读）"))
+            rows.append(("主板 / 系统 · ACPI 高精度热区", instance, f"{value:.1f} °C", "固件热区；不是 CPU 温度"))
         if self.passive_limit is not None:
-            rows.append(("ACPI 被动散热限制", "% Passive Limit", f"{self.passive_limit:.0f} %", "越高越受散热限制"))
+            rows.append(("ACPI 被动散热限制", "% Passive Limit", f"{self.passive_limit:.0f} %", "固件指标"))
         if self.throttle_reasons is not None:
             rows.append(("ACPI 降频原因", "Throttle Reasons", f"0x{int(self.throttle_reasons):X}", self.decode_throttle(self.throttle_reasons)))
-
         signature = tuple(rows)
         if signature != self.thermal_signature:
             self.thermal_signature = signature
             self.thermal_tree.delete(*self.thermal_tree.get_children())
-            if rows:
-                for row in rows:
-                    self.thermal_tree.insert("", "end", values=row)
-            else:
-                self.thermal_tree.insert("", "end", values=("—", "本机没有可读的温度传感器", "—", "—"))
-
-        if self.thermal_third:
-            self.thermal_note.configure(text="已检测到第三方硬件监控（LibreHardwareMonitor / OpenHardwareMonitor），温度取硬件直读值。", fg="#008b72")
-        elif self.temp_trust == "static":
-            self.thermal_note.configure(text="⚠ 本机固件只暴露一个 ACPI 热区，且已实测：CPU 封装功耗从 13 W 拉到 62 W 时它恒为 27.9 °C —— 属于「假传感器」，不能当 CPU 温度用。要拿真实 CPU 温度需装 LibreHardwareMonitor（或 HWiNFO），本程序会自动识别并优先采用。注意：下方的「封装功耗 / 被动散热限制 / 降频原因」不受影响，仍可判断机器是否正在热限。", fg="#c0392b")
-        elif self.temp_trust == "absent":
-            self.thermal_note.configure(text="本机没有可读的温度传感器。可安装 LibreHardwareMonitor 后重启本程序，温度会自动出现。", fg="#c0392b")
-        else:
-            self.thermal_note.configure(text="温度源：Windows ACPI 热区（\\Thermal Zone Information）。若读数不随负载变化，点「重新判定」再观察 30 秒。", fg="#687687")
+            for row in rows or [("—", "本机未提供可读传感器", "—", "—")]:
+                self.thermal_tree.insert("", "end", values=row)
+        self.thermal_note.configure(text="整机温度没有单一含义：主板 / 机身传感器分开显示。CPU 优先封装温度，否则显示核心最高值；GPU 独立。ACPI 热区永不当作 CPU 温度，也不按负载判可信。整机功率仅采用明确系统总功率传感器，不将 CPU + GPU 相加。支持 LibreHardwareMonitor 官方库 JSON 桥接 / LHM、OHM WMI。", fg="#687687")
 
     def build_power_tab(self, parent):
         px = lambda value: int(value * self.dpi_scale)
-        self.power_package_var = tk.StringVar(value="--.- W")
+        self.power_platform_var = tk.StringVar(value="未提供")
+        self.power_system_var = tk.StringVar(value="未提供")
+        self.power_package_var = tk.StringVar(value="未提供")
         self.power_core_var = tk.StringVar(value="--.- W")
         self.power_dram_var = tk.StringVar(value="--.-- W")
         self.power_cpu_var = tk.StringVar(value="-- %")
@@ -550,12 +677,14 @@ class App(tk.Tk):
 
         cards = tk.Frame(parent, bg="#f4f6f8", padx=14)
         cards.pack(fill="x", pady=(0, 12))
-        for column in range(4):
+        for column in range(6):
             cards.grid_columnconfigure(column, weight=1, uniform="power")
         self._power_card(cards, 0, "CPU PACKAGE", self.power_package_var, "#0078d4")
         self._power_card(cards, 1, "CPU 核心", self.power_core_var, "#008b72")
         self._power_card(cards, 2, "DRAM", self.power_dram_var, "#7048a8")
         self._power_card(cards, 3, "CPU 占用", self.power_cpu_var, "#d35400")
+        self._power_card(cards, 4, "整机功率（系统总功率）", self.power_system_var, "#c0392b")
+        self._power_card(cards, 5, "CPU 平台（非整机）", self.power_platform_var, "#7048a8")
 
         panel = tk.Frame(parent, bg="white", highlightbackground="#d7dee8", highlightthickness=1)
         panel.pack(fill="both", expand=True, padx=18, pady=(0, 12))
@@ -572,7 +701,7 @@ class App(tk.Tk):
         status.pack(fill="x", pady=(0, 12))
         self.power_status_label = tk.Label(status, textvariable=self.power_status_var, font=("Microsoft YaHei UI", 10, "bold"), bg="#f4f6f8", fg="#008b72")
         self.power_status_label.pack(side="left")
-        tk.Label(status, text=f"数据源：Windows RAPL　｜　{self.limit_caption()}", font=("Microsoft YaHei UI", 9), bg="#f4f6f8", fg="#687687").pack(side="right")
+        tk.Label(status, text=f"数据源：RAPL / LHM / OHM　｜　{self.limit_caption()}", font=("Microsoft YaHei UI", 9), bg="#f4f6f8", fg="#687687").pack(side="right")
 
     def limit_caption(self):
         """底部右侧那句「最大睿频功耗」说明，随本机 CPU 自动变化。"""
@@ -591,37 +720,145 @@ class App(tk.Tk):
         tk.Label(frame, text=title, font=("Microsoft YaHei UI", 9, "bold"), bg="white", fg="#687687").pack(anchor="w", padx=14, pady=(10, 2))
         tk.Label(frame, textvariable=variable, font=("Microsoft YaHei UI", 20, "bold"), bg="white", fg=color).pack(anchor="w", padx=14, pady=(0, 12))
 
-    def poll_power(self):
+    def check_monitor_companion(self):
+        """Optional local sidecar; only the sensor helper is elevated, once per launch."""
+        bridge = read_bridge_config(self.script_dir)
+        if bridge is not None:
+            fresh = False
+            try:
+                with open(bridge["snapshot_path"], encoding="utf-8-sig") as stream:
+                    stamp = finite_sensor_value(json.load(stream).get("Timestamp"))
+                fresh = stamp is not None and 0 <= time.time() - stamp <= 15
+            except (OSError, ValueError, TypeError, AttributeError):
+                pass
+            if not fresh:
+                self.queue.put(("start_bridge", bridge["script_path"]))
+            return
+        config = os.path.join(self.script_dir, "hardware_monitor_path.txt")
+        try:
+            with open(config, encoding="utf-8-sig") as stream:
+                executable = os.path.abspath(os.path.expandvars(stream.read().strip().strip('"')))
+            if os.path.basename(executable).lower() not in ("librehardwaremonitor.exe", "librehardwaremonitor.windows.forms.exe", "openhardwaremonitor.exe") or not os.path.isfile(executable):
+                return
+        except (OSError, ValueError):
+            return
         if pythoncom is None or win32com is None:
-            self.queue.put(("power_error", "缺少 pywin32，无法读取 RAPL 功耗传感器（pip install pywin32）"))
             return
         pythoncom.CoInitialize()
         try:
             locator = win32com.client.Dispatch("WbemScripting.SWbemLocator")
-            service = locator.ConnectServer(".", "root\\cimv2")
-            service.Security_.ImpersonationLevel = 3
+            for namespace in ("LibreHardwareMonitor", "OpenHardwareMonitor"):
+                try:
+                    service = locator.ConnectServer(".", "root\\" + namespace)
+                    if any(True for _ in service.ExecQuery("SELECT Identifier FROM Hardware")):
+                        return
+                except Exception:
+                    pass
+            self.queue.put(("start_monitor", executable))
+        except Exception:
+            pass
+        finally:
+            pythoncom.CoUninitialize()
+
+    def start_monitor_companion(self, executable, parameters=None, directory=None):
+        # ShellExecuteW is invoked on the UI thread; UAC cancellation is not retried.
+        execute = shell32.ShellExecuteW
+        execute.argtypes = [wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.c_int]
+        execute.restype = ctypes.c_void_p
+        try:
+            result = execute(None, "runas", executable, parameters, directory or os.path.dirname(executable), 1)
+            if not result or result <= 32:
+                self.power_status_var.set("硬件监控未启动 / 已取消；未提供的传感器不会估算")
+        except (OSError, ValueError):
+            self.power_status_var.set("硬件监控未启动；未提供的传感器不会估算")
+
+    def poll_power(self):
+        com_available = pythoncom is not None and win32com is not None
+        if com_available:
+            pythoncom.CoInitialize()
+        try:
             while not self.power_stop.is_set():
                 try:
+                    try:
+                        locator = win32com.client.Dispatch("WbemScripting.SWbemLocator") if com_available else None
+                    except Exception:
+                        locator = None
+                    records = read_bridge_sensors(self.script_dir)
+                    if locator is not None:
+                        records.extend(read_monitor_sensors(locator))
+                    summary = summarize_sensors(records)
                     readings = {}
-                    results = service.ExecQuery(
-                        "SELECT Name, Power FROM Win32_PerfFormattedData_PowerMeterCounter_EnergyMeter"
-                    )
-                    for item in results:
-                        readings[str(item.Name)] = float(item.Power) / 1000.0
-                    # 传感器命名会随平台 / 驱动变化：先找 Package（PKG），再找核心（PP0）与内存（DRAM）
+                    try:
+                        service = locator.ConnectServer(".", "root\\cimv2")
+                        service.Security_.ImpersonationLevel = 3
+                        for item in service.ExecQuery("SELECT Name, Power FROM Win32_PerfFormattedData_PowerMeterCounter_EnergyMeter"):
+                            value = finite_sensor_value(item.Power)
+                            if value is not None:
+                                readings[str(item.Name)] = value / 1000.0
+                    except Exception:
+                        pass
                     package = find_sensor(readings, "RAPL_Package0_PKG", "PKG")
-                    if package is None:
-                        raise RuntimeError("本机没有可用的 RAPL Package 功耗传感器（非 Intel 平台，或计数器和驱动未启用）")
                     core = find_sensor(readings, "RAPL_Package0_PP0", "PP0")
                     dram = find_sensor(readings, "RAPL_Package0_DRAM", "DRAM")
-                    sample = (time.time(), package, core, dram)
-                    self.queue.put(("power", sample))
+                    if package is None:
+                        package = summary["cpu_package_power"]
+                        core, dram = summary["cpu_core_power"], summary["dram_power"]
+                    else:
+                        for name, value in readings.items():
+                            records.append({"source": "Windows RAPL", "name": name, "identifier": name, "parent": "CPU", "hardware_type": "CPU", "region": "cpu", "kind": "cpu_package" if "PKG" in name.upper() else "cpu_core" if "PP0" in name.upper() else "other", "sensor_type": "power", "value": value})
+                    # Battery output is not AC input and is never substituted for system total.
+                    try:
+                        battery_service = locator.ConnectServer(".", "root\\wmi")
+                        for battery in battery_service.ExecQuery("SELECT InstanceName, Discharging, DischargeRate FROM BatteryStatus"):
+                            rate = finite_sensor_value(battery.DischargeRate)
+                            if battery.Discharging and rate is not None and 0 <= rate < 4294967295:
+                                records.extend(parse_sensor_payload([{"Name": "电池放电功率（非插电整机输入）", "Identifier": str(battery.InstanceName), "Parent": "battery", "SensorType": "Power", "Value": rate / 1000.0, "Kind": "battery_discharge"}], source="Windows BatteryStatus"))
+                    except Exception:
+                        pass
+                    self.queue.put(("power_snapshot", time.time(), records, (time.time(), package, core, dram) if package is not None else None))
                     self.power_stop.wait(1.0)
                 except Exception as exc:
                     self.queue.put(("power_error", str(exc)))
                     self.power_stop.wait(3.0)
         finally:
-            pythoncom.CoUninitialize()
+            if com_available:
+                pythoncom.CoUninitialize()
+
+    def clear_power(self, message="未提供 CPU 封装功耗"):
+        self.power_sample = None
+        self.power_history.clear()
+        self.learned_peak = 0.0
+        self.power_package_var.set("未提供")
+        self.power_platform_var.set("未提供")
+        self.power_core_var.set("未提供")
+        self.power_dram_var.set("未提供")
+        self.power_avg_var.set("平均 未提供")
+        self.power_peak_var.set("峰值 未提供")
+        self.power_status_var.set(message)
+        self.power_status_label.configure(fg="#687687")
+        self.draw_power_graph()
+
+    def apply_power_snapshot(self, stamp, records, sample):
+        self.last_power_at = stamp
+        self.last_sensor_at = stamp
+        # Every one-second monitor/bridge snapshot replaces prior actual temperatures.
+        counters = [r for r in self.sensor_records if r["source"] == "Windows GPU counter"]
+        self.sensor_records = [r for r in records if r["sensor_type"] == "temperature"] + counters
+        temperatures = summarize_sensors(self.sensor_records)
+        self.temp_cpu = temperatures["cpu_temperature"]
+        self.temp_gpu = temperatures["gpu_temperature"]
+        self.cpu_temperature_kind = temperatures["cpu_temperature_kind"]
+        self.temp_trust = self._judge_thermal()
+        self.power_records = [r for r in records if r["sensor_type"] == "power"]
+        total = summarize_sensors(self.power_records)["system_power"]
+        self.power_system_var.set("未提供" if total is None else f"{total:.1f} W")
+        if sample is None:
+            self.clear_power()
+        else:
+            self.apply_power(sample)
+        platforms = [r["value"] for r in self.power_records if r["region"] == "cpu" and r["name"].strip().lower() in ("cpu platform", "platform", "psys")]
+        self.power_platform_var.set(f"{platforms[0]:.1f} W" if platforms else "未提供")
+        self.refresh_thermal_view()
 
     def apply_power(self, sample):
         self.power_sample = sample
@@ -629,8 +866,8 @@ class App(tk.Tk):
         _, package, core, dram = sample
         self.power_package_var.set(f"{package:.1f} W")
         # 有些平台只暴露 Package，或者没有 DRAM 传感器 —— 显示「—」而不是误导性的 0.00 W
-        self.power_core_var.set("—" if core is None else f"{core:.1f} W")
-        self.power_dram_var.set("—" if dram is None else f"{dram:.2f} W")
+        self.power_core_var.set("未提供" if core is None else f"{core:.1f} W")
+        self.power_dram_var.set("未提供" if dram is None else f"{dram:.2f} W")
         self.power_cpu_var.set(f"{self.cpu_percent:.0f} %")
         values = [item[1] for item in self.power_history]
         peak = max(values)
@@ -778,9 +1015,10 @@ try {
 } catch { }
 foreach ($ns in 'root\\LibreHardwareMonitor','root\\OpenHardwareMonitor') {
   try {
-    Get-CimInstance -Namespace $ns -ClassName Sensor -ErrorAction Stop | Where-Object { $_.SensorType -eq 'Temperature' } | ForEach-Object {
-      $o.Add(('3|{0}|{1}|{2}' -f $ns.Substring(5), $_.Name, $_.Value))
-    }
+    $hardware = @(Get-CimInstance -Namespace $ns -ClassName Hardware -ErrorAction Stop | Select-Object Identifier,Parent,HardwareType,Name)
+    $sensors = @(Get-CimInstance -Namespace $ns -ClassName Sensor -ErrorAction Stop | Where-Object { $_.SensorType -in 'Temperature','Power' } | Select-Object Name,Identifier,Parent,SensorType,Value)
+    $payload = @{ Source=$ns.Substring(5); Hardware=$hardware; Sensors=$sensors } | ConvertTo-Json -Depth 6 -Compress
+    $o.Add(('S|{0}' -f $payload))
   } catch { }
 }
 $c = @{}
@@ -788,60 +1026,74 @@ Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue | ForEach-
 Get-NetUDPEndpoint -ErrorAction SilentlyContinue | ForEach-Object { if ($_.OwningProcess) { $c[$_.OwningProcess] = 1 + $c[$_.OwningProcess] } }
 foreach ($k in $c.Keys) { $o.Add(('N|{0}|{1}' -f $k, $c[$k])) }
 $o"""
-        while True:
+        while not self.power_stop.is_set():
             try:
                 result = subprocess.run(["powershell.exe", "-NoProfile", "-Command", command], capture_output=True, text=True, timeout=20, creationflags=0x08000000)
-                self._parse_counters(result.stdout)
+                self.queue.put(("counters", result.stdout if result.returncode == 0 else "", time.time()))
             except (OSError, ValueError, subprocess.SubprocessError):
-                pass
-            time.sleep(3)
+                self.queue.put(("counters", "", time.time()))
+            self.power_stop.wait(3.0)
 
     def _parse_counters(self, stdout):
+        # Called only by _drain on the Tk main thread; snapshots replace old values.
         gpu, npu, disk, net = {}, [], {}, {}
-        thermals, gtemps = [], []
-        zones, precise, third = {}, {}, []
+        gtemps, records = [], []
+        zones, precise = {}, {}
+        self.passive_limit = self.throttle_reasons = None
         for line in stdout.splitlines():
             parts = line.split("|")
-            if not parts: continue
             try:
-                if parts[0] == "G": gpu[int(parts[1])] = gpu.get(int(parts[1]), 0.0) + float(parts[2])
-                elif parts[0] == "U": npu.append(float(parts[1]))
-                elif parts[0] == "T": thermals.append(float(parts[1]))
-                elif parts[0] == "V": gtemps.append(float(parts[1]))
-                elif parts[0] == "D": disk[parts[1]] = disk.get(parts[1], 0.0) + float(parts[2])
-                elif parts[0] == "N": net[int(parts[1])] = net.get(int(parts[1]), 0) + int(parts[2])
-                elif parts[0] == "TZ": zones[parts[1]] = temp_celsius(parts[2])
-                elif parts[0] == "HP": precise[parts[1]] = temp_celsius(parts[2])
-                elif parts[0] == "PL": self.passive_limit = float(parts[2])
-                elif parts[0] == "TR": self.throttle_reasons = float(parts[2])
-                elif parts[0] == "3": third.append((parts[1], parts[2], max(0.0, min(120.0, float(parts[3])))))
-            except (ValueError, IndexError):
+                tag = parts[0]
+                if tag == "S":
+                    payload = json.loads(line.split("|", 1)[1])
+                    records.extend(parse_sensor_payload(payload.get("Sensors", []), payload.get("Hardware", []), payload.get("Source", "")))
+                elif tag == "G":
+                    value = finite_sensor_value(parts[2])
+                    if value is not None: gpu[int(parts[1])] = gpu.get(int(parts[1]), 0.0) + value
+                elif tag == "U":
+                    value = finite_sensor_value(parts[1])
+                    if value is not None: npu.append(value)
+                elif tag == "V":
+                    value = finite_sensor_value(parts[1])
+                    if value is not None: gtemps.append(value)
+                elif tag == "D":
+                    value = finite_sensor_value(parts[2])
+                    if value is not None: disk[parts[1]] = disk.get(parts[1], 0.0) + value
+                elif tag == "N": net[int(parts[1])] = net.get(int(parts[1]), 0) + int(parts[2])
+                elif tag == "TZ": zones[parts[1]] = temp_celsius(parts[2])
+                elif tag == "HP": precise[parts[1]] = temp_celsius(parts[2])
+                elif tag == "T": zones["Legacy thermal zone"] = temp_celsius(parts[1])
+                elif tag == "PL": self.passive_limit = finite_sensor_value(parts[2])
+                elif tag == "TR": self.throttle_reasons = finite_sensor_value(parts[2])
+                elif tag == "3": records.extend(parse_sensor_payload([{"Name": parts[2], "Value": parts[3], "SensorType": "Temperature"}], source=parts[1]))
+            except (ValueError, TypeError, IndexError, AttributeError):
                 continue
+        for index, value in enumerate(gtemps):
+            records.extend(parse_sensor_payload([{"Name": "GPU adapter temperature", "Parent": "/gpu/counter", "Identifier": f"/gpu/counter/{index}", "SensorType": "Temperature", "Value": value}], source="Windows GPU counter"))
         self.gpu_pids, self.disk_names, self.net_pids = gpu, disk, net
         self.gpu = min(100.0, sum(gpu.values())) if gpu else None
         self.npu = min(100.0, sum(npu)) if npu else None
-        temps = [temp_celsius(x) for x in thermals]; temps = [x for x in temps if x is not None]
-        self.temp_cpu = max(temps) if temps else None
-        valid = [max(0.0, min(120.0, x)) for x in gtemps]
-        self.temp_gpu = max(valid) if valid else None
-        # ---- 温度 / 散热：记录多源读数并判定真假传感器 ----
-        legacy = []
-        if thermals:  # 兼容旧的 T| 行（原始为开尔文）
-            legacy = [temp_celsius(x) for x in thermals]
-            legacy = [x for x in legacy if x is not None]
-        candidates = legacy + [v for v in zones.values() if v is not None]
-        if candidates:
-            self.temp_cpu = max(candidates)
+        records = read_bridge_sensors(getattr(self, "script_dir", "")) + records
+        self.sensor_records = records
+        summary = summarize_sensors(records)
+        self.temp_cpu, self.temp_gpu = summary["cpu_temperature"], summary["gpu_temperature"]
+        self.cpu_temperature_kind = summary["cpu_temperature_kind"]
         self.zone_temps = {k: v for k, v in zones.items() if v is not None}
         self.zone_precise = {k: v for k, v in precise.items() if v is not None}
-        self.thermal_third = third
-        if third:  # 第三方监控（LibreHardwareMonitor / OpenHardwareMonitor）优先
-            self.temp_cpu = max(x[2] for x in third)
-        if self.temp_cpu is not None:
-            self.thermal_hist.append((self.temp_cpu, self.cpu_percent))
+        self.thermal_third = records
         self.temp_trust = self._judge_thermal()
+        self.refresh_thermal_view()
 
     def update_metrics(self):
+        wall_now = time.time()
+        if self.last_sensor_at and wall_now - self.last_sensor_at > 15:
+            self._parse_counters("")
+            self.last_sensor_at = 0.0
+        if self.last_power_at and wall_now - self.last_power_at > 15:
+            self.power_records = []
+            self.power_system_var.set("未提供")
+            self.clear_power("功耗传感器已过期 / 断连")
+            self.last_power_at = 0.0
         now = time.perf_counter(); current = system_times(); cpu_text = "--"
         if current and self.sys_sample:
             idle = current[0] - self.sys_sample[0]; total = (current[1] + current[2]) - (self.sys_sample[1] + self.sys_sample[2])
@@ -869,8 +1121,7 @@ $o"""
         npu_text = f"{self.npu:.0f}%" if self.npu is not None else "--"
         cpu_temp = f"{self.temp_cpu:.0f}°C" if self.temp_cpu is not None else "--"
         if self.temp_cpu is not None:
-            if self.temp_trust == "static": cpu_temp += "(静态·不可信)"
-            elif self.temp_trust == "reliable": cpu_temp += "(可信)"
+            cpu_temp += "(封装)" if self.cpu_temperature_kind == "cpu_package" else "(核心最高)"
         gpu_temp = f"{self.temp_gpu:.0f}°C" if self.temp_gpu is not None else "--"
         power_text = f"{self.power_sample[1]:.1f}W" if self.power_sample else "--"
         self.metrics.config(text=f"CPU {cpu_text}  功耗 {power_text}  内存 {memory_text}  GPU {gpu_text}  NPU {npu_text}  磁盘 {disk_text}  CPU温 {cpu_temp}  GPU温 {gpu_temp}")
@@ -921,10 +1172,31 @@ $o"""
                 elif msg[0] == "refresh":
                     self.collecting = False
                     self.refresh(manual=False)
+                elif msg[0] == "start_bridge":
+                    script = msg[1]
+                    # Only configured existing .ps1 files; ordinary policy applies, no Bypass.
+                    powershell = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+                    if os.path.isfile(script) and script.lower().endswith(".ps1"):
+                        self.start_monitor_companion(powershell, subprocess.list2cmdline(["-NoProfile", "-File", script]), os.path.dirname(script))
+                elif msg[0] == "start_monitor":
+                    self.start_monitor_companion(msg[1])
+                elif msg[0] == "counters":
+                    self.last_sensor_at = msg[2]
+                    self._parse_counters(msg[1] if time.time() - msg[2] <= 15 else "")
+                elif msg[0] == "power_snapshot":
+                    if time.time() - msg[1] <= 15:
+                        self.apply_power_snapshot(msg[1], msg[2], msg[3])
+                    else:
+                        self.power_records = []
+                        self.power_system_var.set("未提供")
+                        self.clear_power("功耗传感器已过期")
                 elif msg[0] == "power":
+                    self.last_power_at = time.time()
                     self.apply_power(msg[1])
                 elif msg[0] == "power_error":
-                    self.power_status_var.set(f"功耗传感器读取失败：{msg[1]}")
+                    self.power_records = []
+                    self.power_system_var.set("未提供")
+                    self.clear_power(f"功耗传感器读取失败：{msg[1]}")
                     self.power_status_label.configure(fg="#c62828")
         except queue.Empty:
             pass
